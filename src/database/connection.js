@@ -16,11 +16,9 @@ export function getDatabase() {
 }
 
 export function getConnection() {
-  if (!connectionInstance) {
-    const db = getDatabase();
-    connectionInstance = db.connect();
-  }
-  return connectionInstance;
+  const db = getDatabase();
+  // Always create a new connection for thread safety
+  return db.connect();
 }
 
 export function closeDatabase() {

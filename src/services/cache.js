@@ -30,10 +30,10 @@ export async function getCachedResult(cacheKey) {
   return new Promise((resolve, reject) => {
     const conn = getConnection();
     const now = new Date().toISOString();
+    const safeCacheKey = cacheKey.replace(/'/g, "''");
 
     conn.all(
-      'SELECT * FROM search_cache WHERE normalized_query = ? AND expires_at > ?',
-      [cacheKey, now],
+      `SELECT * FROM search_cache WHERE normalized_query = '${safeCacheKey}' AND expires_at > '${now}'`,
       (err, rows) => {
         if (err) {
           reject(err);
@@ -44,9 +44,8 @@ export async function getCachedResult(cacheKey) {
           const cached = rows[0];
           
           // Update hit count
-          conn.run(
-            'UPDATE search_cache SET hit_count = hit_count + 1, last_accessed = ? WHERE id = ?',
-            [now, cached.id],
+          conn.exec(
+            `UPDATE search_cache SET hit_count = hit_count + 1, last_accessed = '${now}' WHERE id = '${cached.id}'`,
             (updateErr) => {
               if (updateErr) {
                 console.error('Failed to update cache hit count:', updateErr);
@@ -77,33 +76,36 @@ export async function setCachedResult(cacheKey, data, ttl) {
   return new Promise((resolve, reject) => {
     const conn = getConnection();
     const id = `cache_${Date.now()}_${uuidv4().substring(0, 8)}`;
-    const expiresAt = new Date(Date.now() + ttl).toISOString();
-    const resultsJson = JSON.stringify(data.results);
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + ttl).toISOString();
+    // Store the entire data object (including results, provider, total, etc.)
+    const resultsJson = JSON.stringify(data);
+    const query = data.query || 'unknown';
+    const provider = data.provider || 'unknown';
 
-    conn.run(
-      `INSERT INTO search_cache (id, query, normalized_query, provider, results, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [id, data.query, cacheKey, data.provider, resultsJson, expiresAt],
-      (err) => {
-        if (err) {
-          console.error('Failed to cache result:', err);
-          reject(err);
-          return;
-        }
-
-        // Clean up expired entries
-        conn.run(
-          'DELETE FROM search_cache WHERE expires_at < ?',
-          [new Date().toISOString()],
-          (cleanupErr) => {
-            if (cleanupErr) {
-              console.error('Failed to cleanup expired cache:', cleanupErr);
-            }
-            resolve();
-          }
-        );
+    // Use exec instead of run for better compatibility
+    const sql = `INSERT INTO search_cache (id, query, normalized_query, provider, results, expires_at)
+                 VALUES ('${id}', '${query.replace(/'/g, "''")}', '${cacheKey.replace(/'/g, "''")}', '${provider}', '${resultsJson.replace(/'/g, "''")}', '${expiresAt}')`;
+    
+    conn.exec(sql, (err) => {
+      if (err) {
+        console.error('Failed to cache result:', err);
+        console.error('SQL:', sql.substring(0, 200));
+        reject(err);
+        return;
       }
-    );
+
+      // Clean up expired entries
+      conn.exec(
+        `DELETE FROM search_cache WHERE expires_at < '${now.toISOString()}'`,
+        (cleanupErr) => {
+          if (cleanupErr) {
+            console.error('Failed to cleanup expired cache:', cleanupErr);
+          }
+          resolve();
+        }
+      );
+    });
   });
 }
 
@@ -117,9 +119,8 @@ export async function getCacheStats() {
         COUNT(*) as total_entries,
         SUM(hit_count) as total_hits,
         AVG(hit_count) as avg_hits,
-        COUNT(CASE WHEN expires_at > ? THEN 1 END) as active_entries
+        COUNT(CASE WHEN expires_at > '${now}' THEN 1 END) as active_entries
        FROM search_cache`,
-      [now],
       (err, rows) => {
         if (err) {
           reject(err);

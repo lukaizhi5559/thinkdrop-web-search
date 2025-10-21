@@ -78,9 +78,21 @@ Available endpoints:
   - GET  /service.health   (Health check)
   - GET  /service.capabilities (Service info)
 
-Providers:
-  - DuckDuckGo: ✓ Available (Primary)
-  - NewsAPI: ${process.env.NEWSAPI_KEY ? '✓ Configured' : '✗ Not configured'} (Optional)
+Smart Routing Strategy:
+  1. DuckDuckGo (free, unlimited) - Try first
+  2. Intent Classification - Detect query type
+  3. Route to appropriate Brave API:
+     • Rich Search (prices, weather, crypto)
+     • News Search (current events)
+     • Video Search (movies, tutorials)
+     • Image Search (pictures, photos)
+     • Web Search (general queries)
+  4. Fallback to Brave Web if needed
+
+Providers Status:
+  - DuckDuckGo: ✓ Always available
+  - Brave APIs: ${process.env.BRAVE_API_WEB_KEY ? '✓ Configured (Web, Rich, News, Video, Image)' : '✗ Not configured (optional)'}
+  - NewsAPI: ${process.env.NEWSAPI_KEY ? '✓ Configured' : '✗ Not configured (optional)'}
 
 Server ready at http://${HOST}:${PORT}
       `);

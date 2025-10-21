@@ -1,5 +1,13 @@
 import { searchNewsAPI, searchNews } from '../providers/newsapi.js';
 import { searchDuckDuckGo } from '../providers/duckduckgo.js';
+import { 
+  searchBraveWeb, 
+  searchBraveRich, 
+  searchBraveNews, 
+  searchBraveVideo, 
+  searchBraveImage 
+} from '../providers/braveMulti.js';
+import { classifyQueryIntent, explainIntent } from './intentClassifier.js';
 import { getCachedResult, setCachedResult, normalizeQuery, getCacheTTL } from './cache.js';
 import { logSearchHistory } from './metrics.js';
 
@@ -11,47 +19,111 @@ async function sleep(ms) {
 }
 
 async function searchWithFallback(query, options = {}) {
-  // DuckDuckGo is now primary, NewsAPI as optional fallback
-  const providers = options.provider === 'auto' || !options.provider
-    ? ['duckduckgo'] 
-    : [options.provider];
-  
+  // If specific provider requested, use it directly
+  if (options.provider && options.provider !== 'auto') {
+    if (options.provider === 'brave-rich') {
+      return await searchBraveRich(query, options);
+    } else if (options.provider === 'brave-news') {
+      return await searchBraveNews(query, options);
+    } else if (options.provider === 'brave-video') {
+      return await searchBraveVideo(query, options);
+    } else if (options.provider === 'brave-image') {
+      return await searchBraveImage(query, options);
+    } else if (options.provider === 'brave-web') {
+      return await searchBraveWeb(query, options);
+    } else if (options.provider === 'duckduckgo') {
+      return await searchDuckDuckGo(query, options);
+    } else if (options.provider === 'newsapi') {
+      return await searchNewsAPI(query, options);
+    }
+  }
+
+  // Auto mode: Smart routing with fallback
   let lastError = null;
   
-  for (const provider of providers) {
-    let retries = 0;
+  // Step 1: Try DuckDuckGo first (free, unlimited)
+  try {
+    console.log('🔍 Step 1: Trying DuckDuckGo (free provider)...');
+    const duckResult = await searchDuckDuckGo(query, options);
     
-    while (retries < MAX_RETRIES) {
-      try {
-        if (provider === 'duckduckgo') {
-          return await searchDuckDuckGo(query, options);
-        } else if (provider === 'newsapi') {
-          return await searchNewsAPI(query, options);
-        }
-      } catch (error) {
-        lastError = error;
-        
-        // Don't retry on auth errors
-        if (error.message.includes('INVALID_API_KEY')) {
-          break;
-        }
-        
-        // Retry on rate limit or network errors
-        if (retries < MAX_RETRIES - 1) {
-          const delay = RETRY_DELAY * Math.pow(2, retries);
-          console.warn(`Provider ${provider} failed (attempt ${retries + 1}/${MAX_RETRIES}), retrying in ${delay}ms...`);
-          await sleep(delay);
-          retries++;
-        } else {
-          console.warn(`Provider ${provider} failed after ${MAX_RETRIES} attempts:`, error.message);
-          break;
-        }
+    // Check if we got results
+    if (duckResult.results && duckResult.results.length > 0) {
+      console.log(`✅ DuckDuckGo returned ${duckResult.results.length} results`);
+      return duckResult;
+    }
+    
+    console.log('⚠️  DuckDuckGo returned empty results, using smart routing...');
+  } catch (error) {
+    console.warn('⚠️  DuckDuckGo failed:', error.message);
+    lastError = error;
+  }
+  
+  // Step 2: Classify query intent and route to appropriate Brave API
+  const intent = classifyQueryIntent(query);
+  const explanation = explainIntent(query, intent);
+  console.log(`🎯 Step 2: Detected intent: ${intent} - ${explanation}`);
+  
+  // Try the appropriate Brave API based on intent
+  try {
+    let braveResult;
+    
+    switch (intent) {
+      case 'rich':
+        console.log('💰 Trying Brave Rich Search (prices, weather, calculations)...');
+        braveResult = await searchBraveRich(query, options);
+        break;
+      
+      case 'news':
+        console.log('📰 Trying Brave News Search (current events)...');
+        braveResult = await searchBraveNews(query, options);
+        break;
+      
+      case 'video':
+        console.log('🎬 Trying Brave Video Search (movies, shows, tutorials)...');
+        braveResult = await searchBraveVideo(query, options);
+        break;
+      
+      case 'image':
+        console.log('🖼️  Trying Brave Image Search (pictures, photos)...');
+        braveResult = await searchBraveImage(query, options);
+        break;
+      
+      case 'web':
+      default:
+        console.log('🌐 Trying Brave Web Search (general queries)...');
+        braveResult = await searchBraveWeb(query, options);
+        break;
+    }
+    
+    if (braveResult.results && braveResult.results.length > 0) {
+      console.log(`✅ Brave ${intent} search returned ${braveResult.results.length} results`);
+      return braveResult;
+    }
+    
+    console.log(`⚠️  Brave ${intent} search returned empty results, trying fallback...`);
+  } catch (error) {
+    console.warn(`⚠️  Brave ${intent} search failed:`, error.message);
+    lastError = error;
+  }
+  
+  // Step 3: Fallback to Brave Web Search if intent-specific search failed
+  if (intent !== 'web') {
+    try {
+      console.log('🌐 Step 3: Fallback to Brave Web Search...');
+      const braveWebResult = await searchBraveWeb(query, options);
+      
+      if (braveWebResult.results && braveWebResult.results.length > 0) {
+        console.log(`✅ Brave Web returned ${braveWebResult.results.length} results`);
+        return braveWebResult;
       }
+    } catch (error) {
+      console.warn('⚠️  Brave Web fallback failed:', error.message);
+      lastError = error;
     }
   }
   
-  // All providers failed
-  throw new Error(`PROVIDER_ERROR: All providers failed. Last error: ${lastError?.message}`);
+  // All providers failed or returned empty
+  throw new Error(`PROVIDER_ERROR: All providers failed or returned empty results. Last error: ${lastError?.message}`);
 }
 
 export async function search(query, options = {}, context = {}) {

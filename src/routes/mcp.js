@@ -201,8 +201,14 @@ router.get('/service.health', async (req, res) => {
     const metrics = getMetrics();
 
     // Check provider availability
+    const braveAvailable = process.env.BRAVE_API_WEB_KEY ? 'available' : 'unavailable';
     const providers = {
       duckduckgo: 'available',
+      'brave-web': braveAvailable,
+      'brave-rich': braveAvailable,
+      'brave-news': braveAvailable,
+      'brave-video': braveAvailable,
+      'brave-image': braveAvailable,
       newsapi: process.env.NEWSAPI_KEY ? 'available' : 'unavailable'
     };
 

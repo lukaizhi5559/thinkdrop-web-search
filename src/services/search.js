@@ -1,5 +1,6 @@
 import { searchNewsAPI, searchNews } from '../providers/newsapi.js';
 import { searchDuckDuckGo } from '../providers/duckduckgo.js';
+import { searchSearXNG } from '../providers/searxng.js';
 import { 
   searchBraveWeb, 
   searchBraveRich, 
@@ -120,6 +121,22 @@ async function searchWithFallback(query, options = {}) {
       console.warn('⚠️  Brave Web fallback failed:', error.message);
       lastError = error;
     }
+  }
+  
+  // Step 4: Try SearXNG (free, meta-search)
+  try {
+    console.log('🔍 Step 4: Trying SearXNG (meta-search)...');
+    const searxResult = await searchSearXNG(query, options);
+    
+    if (searxResult.results && searxResult.results.length > 0) {
+      console.log(`✅ SearXNG returned ${searxResult.results.length} results`);
+      return searxResult;
+    }
+    
+    console.log('⚠️  SearXNG returned empty results');
+  } catch (error) {
+    console.warn('⚠️  SearXNG failed:', error.message);
+    lastError = error;
   }
   
   // All providers failed or returned empty

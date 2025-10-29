@@ -128,16 +128,18 @@ export async function getCacheStats() {
         }
 
         const stats = rows[0] || {};
-        const hitRate = stats.total_hits > 0 
-          ? (stats.total_hits / (stats.total_hits + stats.total_entries)) 
+        const totalHits = Number(stats.total_hits) || 0;
+        const totalEntries = Number(stats.total_entries) || 0;
+        const hitRate = totalHits > 0 
+          ? (totalHits / (totalHits + totalEntries)) 
           : 0;
 
         resolve({
           enabled: CACHE_ENABLED,
-          size: stats.active_entries || 0,
-          totalEntries: stats.total_entries || 0,
-          totalHits: stats.total_hits || 0,
-          hitRate: parseFloat(hitRate.toFixed(2))
+          size: Number(stats.active_entries) || 0,
+          totalEntries: totalEntries,
+          totalHits: totalHits,
+          hitRate: Number.isFinite(hitRate) ? parseFloat(hitRate.toFixed(2)) : 0
         });
       }
     );

@@ -89,7 +89,7 @@ router.post('/web.search', async (req, res) => {
         'error',
         null,
         {
-          code: error.message.includes('PROVIDER_ERROR') ? 'PROVIDER_ERROR' : 'INTERNAL_ERROR',
+          code: 'INTERNAL_ERROR',
           message: error.message
         },
         { elapsedMs }

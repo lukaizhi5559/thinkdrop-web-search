@@ -84,19 +84,20 @@ Available endpoints:
   - GET  /service.capabilities (Service info)
 
 Smart Routing Strategy:
-  1. DuckDuckGo (free, unlimited) - Try first
-  2. Intent Classification - Detect query type
-  3. Route to appropriate Brave API:
+  1. Intent Classification - Detect query type
+  2. Route to appropriate Brave API:
      • Rich Search (prices, weather, crypto)
      • News Search (current events)
      • Video Search (movies, tutorials)
      • Image Search (pictures, photos)
      • Web Search (general queries)
-  4. Fallback to Brave Web if needed
+  3. Fallback to Brave Web if needed
+  4. Fallback to DuckDuckGo (free, unlimited)
+  5. LLM fallback response if all providers fail
 
 Providers Status:
-  - DuckDuckGo: ✓ Always available
-  - Brave APIs: ${process.env.BRAVE_API_WEB_KEY ? '✓ Configured (Web, Rich, News, Video, Image)' : '✗ Not configured (optional)'}
+  - Brave APIs: ${process.env.BRAVE_API_WEB_KEY ? '✓ Configured (Web, Rich, News, Video, Image)' : '✗ Not configured'}
+  - DuckDuckGo: ✓ Always available (fallback)
   - NewsAPI: ${process.env.NEWSAPI_KEY ? '✓ Configured' : '✗ Not configured (optional)'}
 
 Server ready at http://${HOST}:${PORT}

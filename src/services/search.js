@@ -1,6 +1,5 @@
 import { searchNewsAPI, searchNews } from '../providers/newsapi.js';
 import { searchDuckDuckGo } from '../providers/duckduckgo.js';
-import { searchSearXNG } from '../providers/searxng.js';
 import { 
   searchBraveWeb, 
   searchBraveRich, 
@@ -42,27 +41,10 @@ async function searchWithFallback(query, options = {}) {
   // Auto mode: Smart routing with fallback
   let lastError = null;
   
-  // Step 1: Try DuckDuckGo first (free, unlimited)
-  try {
-    console.log('🔍 Step 1: Trying DuckDuckGo (free provider)...');
-    const duckResult = await searchDuckDuckGo(query, options);
-    
-    // Check if we got results
-    if (duckResult.results && duckResult.results.length > 0) {
-      console.log(`✅ DuckDuckGo returned ${duckResult.results.length} results`);
-      return duckResult;
-    }
-    
-    console.log('⚠️  DuckDuckGo returned empty results, using smart routing...');
-  } catch (error) {
-    console.warn('⚠️  DuckDuckGo failed:', error.message);
-    lastError = error;
-  }
-  
-  // Step 2: Classify query intent and route to appropriate Brave API
+  // Step 1: Classify query intent and route to appropriate Brave API
   const intent = classifyQueryIntent(query);
   const explanation = explainIntent(query, intent);
-  console.log(`🎯 Step 2: Detected intent: ${intent} - ${explanation}`);
+  console.log(`🎯 Step 1: Detected intent: ${intent} - ${explanation}`);
   
   // Try the appropriate Brave API based on intent
   try {
@@ -107,10 +89,10 @@ async function searchWithFallback(query, options = {}) {
     lastError = error;
   }
   
-  // Step 3: Fallback to Brave Web Search if intent-specific search failed
+  // Step 2: Fallback to Brave Web Search if intent-specific search failed
   if (intent !== 'web') {
     try {
-      console.log('🌐 Step 3: Fallback to Brave Web Search...');
+      console.log('🌐 Step 2: Fallback to Brave Web Search...');
       const braveWebResult = await searchBraveWeb(query, options);
       
       if (braveWebResult.results && braveWebResult.results.length > 0) {
@@ -123,24 +105,37 @@ async function searchWithFallback(query, options = {}) {
     }
   }
   
-  // Step 4: Try SearXNG (free, meta-search)
+  // Step 3: Try DuckDuckGo (free, unlimited)
   try {
-    console.log('🔍 Step 4: Trying SearXNG (meta-search)...');
-    const searxResult = await searchSearXNG(query, options);
+    console.log('🔍 Step 3: Trying DuckDuckGo (free provider)...');
+    const duckResult = await searchDuckDuckGo(query, options);
     
-    if (searxResult.results && searxResult.results.length > 0) {
-      console.log(`✅ SearXNG returned ${searxResult.results.length} results`);
-      return searxResult;
+    // Check if we got results
+    if (duckResult.results && duckResult.results.length > 0) {
+      console.log(`✅ DuckDuckGo returned ${duckResult.results.length} results`);
+      return duckResult;
     }
     
-    console.log('⚠️  SearXNG returned empty results');
+    console.log('⚠️  DuckDuckGo returned empty results');
   } catch (error) {
-    console.warn('⚠️  SearXNG failed:', error.message);
+    console.warn('⚠️  DuckDuckGo failed:', error.message);
     lastError = error;
   }
   
-  // All providers failed or returned empty
-  throw new Error(`PROVIDER_ERROR: All providers failed or returned empty results. Last error: ${lastError?.message}`);
+  // Step 4: All providers failed - return LLM fallback response
+  console.log('🤖 All search providers failed, returning LLM fallback response');
+  return {
+    results: [{
+      title: 'Search providers unavailable',
+      description: `I apologize, but I'm unable to search the web right now due to provider limitations. However, I can try to help answer your question: "${query}" based on my training data. Please note that my knowledge may be outdated and I cannot access real-time information.`,
+      url: '',
+      provider: 'llm-fallback',
+      score: 0
+    }],
+    total: 1,
+    provider: 'llm-fallback',
+    fallbackReason: lastError?.message || 'All search providers failed or returned empty results'
+  };
 }
 
 export async function search(query, options = {}, context = {}) {

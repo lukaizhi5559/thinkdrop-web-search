@@ -8,12 +8,18 @@
 import fetch from 'node-fetch';
 
 // Public SearXNG instances (fallback to multiple for reliability)
+// Updated list with more reliable instances as of 2026
 const SEARXNG_INSTANCES = [
   'https://searx.be',
   'https://search.sapti.me',
   'https://searx.tiekoetter.com',
   'https://search.bus-hit.me',
-  'https://searx.work'
+  'https://searx.work',
+  'https://searx.fmac.xyz',
+  'https://search.ononoki.org',
+  'https://searx.namejeff.xyz',
+  'https://search.projectsegfau.lt',
+  'https://searx.lunar.icu'
 ];
 
 /**
@@ -25,7 +31,7 @@ const SEARXNG_INSTANCES = [
 export async function searchSearXNG(query, options = {}) {
   const {
     limit = 10,
-    timeout = 5000,
+    timeout = 8000, // Increased to 8s for better reliability
     engines = 'google,bing,duckduckgo' // Use multiple engines
   } = options;
 

@@ -79,7 +79,8 @@ async function start() {
 Available endpoints:
   - POST /web.search       (General web search)
   - POST /web.news         (News search)
-  - POST /web.scrape       (URL scraping - planned)
+  - POST /web.crawl        (URL crawl — free HTML→text extractor)
+  - POST /web.scrape       (alias for /web.crawl)
   - GET  /service.health   (Health check)
   - GET  /service.capabilities (Service info)
 

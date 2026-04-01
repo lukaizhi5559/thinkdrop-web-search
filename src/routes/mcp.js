@@ -1,5 +1,6 @@
 import express from 'express';
 import { search, searchNewsOnly } from '../services/search.js';
+import { crawlUrl, crawlUrls } from '../services/crawl.js';
 import { getCacheStats } from '../services/cache.js';
 import { getMetrics, incrementRequestCount, incrementSearchCount, incrementErrorCount, recordResponseTime } from '../services/metrics.js';
 
@@ -176,23 +177,60 @@ router.post('/web.news', async (req, res) => {
   }
 });
 
-// POST /web.scrape - URL scraping (future feature)
-router.post('/web.scrape', async (req, res) => {
-  const { requestId } = req.body;
+// POST /web.crawl - Fetch and extract readable text from one or more URLs (free, no API key)
+// Also aliased as POST /web.scrape for backwards compatibility
+async function handleCrawl(req, res) {
+  const startTime = Date.now();
+  incrementRequestCount();
 
-  res.status(501).json(
-    createMCPResponse(
-      requestId,
-      'web.scrape',
-      'error',
-      null,
-      {
-        code: 'NOT_IMPLEMENTED',
-        message: 'URL scraping is not yet implemented. This feature is planned for a future release.'
-      }
-    )
-  );
-});
+  const { requestId, payload } = req.body;
+
+  try {
+    if (!payload || (!payload.url && !payload.urls)) {
+      incrementErrorCount();
+      return res.status(400).json(
+        createMCPResponse(requestId, 'web.crawl', 'error', null, {
+          code: 'INVALID_REQUEST',
+          message: 'Missing required field: url (string) or urls (array)'
+        })
+      );
+    }
+
+    const opts = {
+      maxChars:    payload.maxChars    || 20000,
+      timeoutMs:   payload.timeoutMs   || 15000,
+      concurrency: payload.concurrency || 3,
+    };
+
+    let data;
+    if (payload.urls && Array.isArray(payload.urls)) {
+      data = await crawlUrls(payload.urls, opts);
+    } else {
+      const result = await crawlUrl(payload.url, opts);
+      data = { results: [result], elapsedMs: result.elapsedMs };
+    }
+
+    const elapsedMs = Date.now() - startTime;
+    recordResponseTime(elapsedMs);
+
+    res.json(createMCPResponse(requestId, 'web.crawl', 'ok', data, null, { elapsedMs }));
+
+  } catch (error) {
+    incrementErrorCount();
+    const elapsedMs = Date.now() - startTime;
+    recordResponseTime(elapsedMs);
+    console.error('Crawl error:', error);
+    res.status(500).json(
+      createMCPResponse(requestId, 'web.crawl', 'error', null, {
+        code: 'INTERNAL_ERROR',
+        message: error.message
+      }, { elapsedMs })
+    );
+  }
+}
+
+router.post('/web.crawl',  handleCrawl);
+router.post('/web.scrape', handleCrawl);
 
 // GET /service.health - Health check
 router.get('/service.health', async (req, res) => {
@@ -281,9 +319,19 @@ router.get('/service.capabilities', (req, res) => {
           }
         },
         {
-          name: 'web.scrape',
-          description: 'Scrape content from URL (future)',
-          status: 'planned'
+          name: 'web.crawl',
+          description: 'Fetch and extract readable text from one or more URLs — free, no API key needed. Also available as /web.scrape.',
+          inputSchema: {
+            url:         'string (required if urls not provided)',
+            urls:        'string[] (required if url not provided — batch crawl)',
+            maxChars:    'number (optional, default: 20000)',
+            timeoutMs:   'number (optional, default: 15000)',
+            concurrency: 'number (optional, default: 3 — for batch crawl)'
+          },
+          outputSchema: {
+            results: 'array of { ok, url, statusCode, title, description, content, contentLength, truncated, elapsedMs }',
+            elapsedMs: 'number'
+          }
         }
       ],
       providers: [

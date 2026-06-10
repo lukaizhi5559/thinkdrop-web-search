@@ -1,11 +1,96 @@
 import axios from 'axios';
 import dotenv from 'dotenv';
+import { downloadImage, getCachePath, isCached, ensureCacheDir, cleanupOldImages } from '../utils/imageCache.js';
 
 dotenv.config();
+
+// Initialize cache on module load
+ensureCacheDir().catch(console.error);
+// Clean up old images periodically (every hour)
+setInterval(() => cleanupOldImages().catch(console.error), 60 * 60 * 1000);
 
 const BRAVE_API_KEY = process.env.BRAVE_API_WEB_KEY; // Using web key for all endpoints
 const BASE_URL = 'https://api.search.brave.com/res/v1';
 const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 10000;
+const IMAGE_VALIDATION_TIMEOUT = 5000; // 5s timeout for image validation
+
+/**
+ * Validate image URL accessibility
+ * Returns true if URL is accessible, false otherwise
+ */
+async function validateImageUrl(url) {
+  if (!url || !url.startsWith('http')) return false;
+  
+  try {
+    const response = await axios.head(url, {
+      timeout: IMAGE_VALIDATION_TIMEOUT,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      // Don't throw on 4xx/5xx - we just want to check if it's reachable
+      validateStatus: () => true
+    });
+    
+    // Accept 200-299 status codes
+    // Reject 400, 401, 403, 404, etc.
+    if (response.status >= 200 && response.status < 300) {
+      // Also check content-type if available
+      const contentType = response.headers['content-type'] || '';
+      if (contentType && !contentType.includes('image') && !contentType.includes('octet-stream')) {
+        return false;
+      }
+      return true;
+    }
+    return false;
+  } catch (error) {
+    return false;
+  }
+}
+
+/**
+ * Filter image results to only include accessible URLs
+ * Validates URLs in parallel for efficiency
+ */
+async function filterAccessibleImages(images, maxResults = 10) {
+  if (!images || images.length === 0) return [];
+  
+  const validatedImages = [];
+  
+  // Process in batches to avoid overwhelming the network
+  const batchSize = 3;
+  for (let i = 0; i < images.length && validatedImages.length < maxResults; i += batchSize) {
+    const batch = images.slice(i, i + batchSize);
+    
+    // Validate batch in parallel
+    const batchResults = await Promise.all(
+      batch.map(async (image) => {
+        const imageUrl = image.properties?.url;
+        const thumbnailUrl = image.thumbnail?.src;
+        
+        // Try main image URL first
+        if (imageUrl && await validateImageUrl(imageUrl)) {
+          return { ...image, validatedUrl: imageUrl, isValid: true };
+        }
+        
+        // Fall back to thumbnail if main fails
+        if (thumbnailUrl && await validateImageUrl(thumbnailUrl)) {
+          return { ...image, validatedUrl: thumbnailUrl, isValid: true };
+        }
+        
+        return { ...image, isValid: false };
+      })
+    );
+    
+    // Add valid images to results
+    for (const result of batchResults) {
+      if (result.isValid && validatedImages.length < maxResults) {
+        validatedImages.push(result);
+      }
+    }
+  }
+  
+  return validatedImages;
+}
 
 /**
  * Brave Web Search API (traditional search results)
@@ -357,30 +442,93 @@ export async function searchBraveImage(query, options = {}) {
     );
 
     const elapsedMs = Date.now() - startTime;
-    const results = [];
+    const rawResults = [];
 
-    // Parse image results
+    // Parse image results from API
     if (response.data.results) {
       response.data.results.forEach((image, idx) => {
-        results.push({
+        rawResults.push({
           title: image.title || '',
           description: image.description || '',
           url: image.url || '',
           source: image.source || 'Image Source',
           type: 'image-result',
           relevanceScore: 0.95 - (idx * 0.03),
+          thumbnail: image.thumbnail,
+          properties: {
+            url: image.properties?.url,
+            width: image.properties?.width,
+            height: image.properties?.height,
+            format: image.properties?.format
+          }
+        });
+      });
+    }
+
+    // Download images to local cache and serve from there
+    // This avoids hotlinking issues with Getty, Pinterest, etc.
+    const results = await Promise.all(
+      rawResults.slice(0, options.maxResults || 10).map(async (image) => {
+        // Try multiple sources for the image
+        const thumbnailUrl = image.thumbnail?.src;
+        const originalUrl = image.properties?.url;
+        const pageUrl = image.url;
+        
+        // Try to download: thumbnail first, then original
+        let cachedFilename = null;
+        let sourceUrl = null;
+        
+        // Try thumbnail
+        if (thumbnailUrl) {
+          cachedFilename = await downloadImage(thumbnailUrl);
+          if (cachedFilename) {
+            sourceUrl = thumbnailUrl;
+          }
+        }
+        
+        // Fallback to original URL
+        if (!cachedFilename && originalUrl) {
+          cachedFilename = await downloadImage(originalUrl);
+          if (cachedFilename) {
+            sourceUrl = originalUrl;
+          }
+        }
+        
+        // Build local URL if we have a cached file
+        // Use custom protocol for reliable local image serving
+        const localUrl = cachedFilename 
+          ? `thinkdrop-image://${cachedFilename}`
+          : null;
+        
+        return {
+          title: image.title,
+          description: image.description,
+          // Keep original page URL for context
+          url: pageUrl,
+          source: image.source,
+          type: 'image-result',
+          relevanceScore: image.relevanceScore,
           metadata: {
             thumbnail: image.thumbnail,
             properties: {
-              url: image.properties?.url,
+              // Use local URL as primary - always loads reliably
+              url: localUrl || thumbnailUrl || originalUrl,
+              // Store original for reference/click-to-view
+              originalUrl: originalUrl,
+              // Store if we have a cached version
+              cached: !!cachedFilename,
+              cachedFilename: cachedFilename,
               width: image.properties?.width,
               height: image.properties?.height,
               format: image.properties?.format
             }
           }
-        });
-      });
-    }
+        };
+      })
+    );
+
+    const cachedCount = results.filter(r => r.metadata.properties.cached).length;
+    console.log(`[BraveImage] Downloaded ${cachedCount}/${results.length} images to cache`);
 
     return {
       results,

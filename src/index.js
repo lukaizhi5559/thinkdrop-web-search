@@ -8,6 +8,7 @@ import { initializeDatabase } from './database/init.js';
 import { authenticateRequest } from './middleware/auth.js';
 import { rateLimitMiddleware } from './middleware/rateLimit.js';
 import mcpRoutes from './routes/mcp.js';
+import { getCachePath, isCached } from './utils/imageCache.js';
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -31,6 +32,42 @@ app.use(authenticateRequest);
 
 // Routes
 app.use('/', mcpRoutes);
+
+// Serve cached images
+app.get('/images/:filename', async (req, res) => {
+  const { filename } = req.params;
+  
+  // Security: only allow alphanumeric, dash, underscore, and dot in filename
+  if (!filename.match(/^[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/)) {
+    return res.status(400).send('Invalid filename');
+  }
+  
+  try {
+    const exists = await isCached(filename);
+    if (!exists) {
+      return res.status(404).send('Image not found');
+    }
+    
+    const filepath = getCachePath(filename);
+    
+    // Determine content type from extension
+    const ext = path.extname(filename).toLowerCase();
+    const contentTypes = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp'
+    };
+    
+    res.setHeader('Content-Type', contentTypes[ext] || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 24 hours
+    res.sendFile(filepath);
+  } catch (error) {
+    console.error('[ImageServer] Error serving image:', error);
+    res.status(500).send('Error serving image');
+  }
+});
 
 // Error handling middleware
 app.use((err, req, res, next) => {

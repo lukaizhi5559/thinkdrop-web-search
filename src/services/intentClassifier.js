@@ -244,12 +244,41 @@ const QUERY_PATTERNS = {
   }
 };
 
+// Time-sensitive keywords that need current year for up-to-date results
+const TIME_SENSITIVE_KEYWORDS = ['current', 'latest', 'present', 'today', 'now'];
+const YEAR_PATTERN = /\b(19|20)\d{2}s?\b/;  // Matches 1980, 2025, 80s, 1920s
+
+/**
+ * Enhance time-sensitive queries by adding current year when appropriate.
+ * Only adds year if query has time keywords AND no explicit year already present.
+ * Preserves historical queries like "Mario from the 80s", "clothing of the 1920s"
+ * @param {string} query - Original search query
+ * @returns {string} - Enhanced query if time-sensitive, otherwise original
+ */
+function enhanceTimeSensitiveQuery(query) {
+  const queryLower = query.toLowerCase();
+  const hasTimeKeyword = TIME_SENSITIVE_KEYWORDS.some(kw => queryLower.includes(kw));
+  const hasExplicitYear = YEAR_PATTERN.test(query);
+  
+  if (hasTimeKeyword && !hasExplicitYear) {
+    const currentYear = new Date().getFullYear();
+    const enhanced = `${query} ${currentYear}`;
+    console.log(`🕐 Time-sensitive query enhanced: "${query}" → "${enhanced}"`);
+    return enhanced;
+  }
+  
+  return query;
+}
+
 /**
  * Classify query intent using keyword and pattern matching
  * @param {string} query - The search query
  * @returns {string} - The detected intent (rich, news, video, image, web)
  */
-export function classifyQueryIntent(query) {
+export function classifyQueryIntent(originalQuery) {
+  // Enhance time-sensitive queries before classification
+  const query = enhanceTimeSensitiveQuery(originalQuery);
+  
   const scores = {
     rich: 0,
     news: 0,
@@ -307,16 +336,16 @@ export function classifyQueryIntent(query) {
   if (topIntent === 'web' && secondScore > 3) {
     const secondIntent = sortedIntents[1][0];
     console.log(`⚠️  Web search scored highest, but ${secondIntent} has strong signal (${secondScore}). Using ${secondIntent}.`);
-    return secondIntent;
+    return { intent: secondIntent, enhancedQuery: query };
   }
   
   // If top score is very low, default to web
   if (topScore < 2) {
     console.log('⚠️  All scores very low, defaulting to web search');
-    return 'web';
+    return { intent: 'web', enhancedQuery: query };
   }
   
-  return topIntent;
+  return { intent: topIntent, enhancedQuery: query };
 }
 
 /**
@@ -363,9 +392,10 @@ export function testClassifier() {
   
   console.log('\n🧪 Testing Intent Classifier:\n');
   testQueries.forEach(query => {
-    const intent = classifyQueryIntent(query);
+    const { intent, enhancedQuery } = classifyQueryIntent(query);
     const explanation = explainIntent(query, intent);
     console.log(`Query: "${query}"`);
+    console.log(`Enhanced: "${enhancedQuery}"`);
     console.log(`Intent: ${intent} - ${explanation}\n`);
   });
 }

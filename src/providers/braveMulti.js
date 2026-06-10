@@ -6,8 +6,10 @@ dotenv.config();
 
 // Initialize cache on module load
 ensureCacheDir().catch(console.error);
-// Clean up old images periodically (every hour)
-setInterval(() => cleanupOldImages().catch(console.error), 60 * 60 * 1000);
+// Clean up old images periodically (every hour) - singleton guard prevents duplicate timers
+if (!global.__imageCacheCleanupInterval) {
+  global.__imageCacheCleanupInterval = setInterval(() => cleanupOldImages().catch(console.error), 60 * 60 * 1000);
+}
 
 const BRAVE_API_KEY = process.env.BRAVE_API_WEB_KEY; // Using web key for all endpoints
 const BASE_URL = 'https://api.search.brave.com/res/v1';
@@ -465,10 +467,13 @@ export async function searchBraveImage(query, options = {}) {
       });
     }
 
+    // Filter to only accessible images before downloading
+    const accessibleResults = await filterAccessibleImages(rawResults, options.maxResults || 10);
+
     // Download images to local cache and serve from there
     // This avoids hotlinking issues with Getty, Pinterest, etc.
     const results = await Promise.all(
-      rawResults.slice(0, options.maxResults || 10).map(async (image) => {
+      accessibleResults.map(async (image) => {
         // Try multiple sources for the image
         const thumbnailUrl = image.thumbnail?.src;
         const originalUrl = image.properties?.url;

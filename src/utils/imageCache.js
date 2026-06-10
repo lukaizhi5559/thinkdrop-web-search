@@ -25,9 +25,14 @@ async function ensureCacheDir() {
  * Generate cache filename from URL
  */
 function generateCacheFilename(url) {
-  const hash = crypto.createHash('md5').update(url).digest('hex');
+  const hash = crypto.createHash('sha256').update(url).digest('hex').slice(0, 32); // Use first 32 chars
   const timestamp = Date.now();
-  const ext = path.extname(new URL(url).pathname) || '.jpg';
+  let ext;
+  try {
+    ext = path.extname(new URL(url).pathname) || '.jpg';
+  } catch {
+    ext = '.jpg';
+  }
   return `${hash}_${timestamp}${ext}`;
 }
 
@@ -97,17 +102,29 @@ async function downloadImage(url) {
 
 /**
  * Get full path to cached file
+ * Includes symlink protection - verifies resolved path is within cache directory
  */
-function getCachePath(filename) {
-  return path.join(CACHE_DIR, filename);
+async function getCachePath(filename) {
+  const filepath = path.join(CACHE_DIR, filename);
+  const resolvedPath = await fs.realpath(filepath).catch(() => filepath);
+  if (!resolvedPath.startsWith(CACHE_DIR)) {
+    throw new Error('Invalid cache path: path traversal detected');
+  }
+  return resolvedPath;
 }
 
 /**
  * Check if file exists in cache
+ * Includes symlink protection - verifies resolved path is within cache directory
  */
 async function isCached(filename) {
+  const filepath = path.join(CACHE_DIR, filename);
   try {
-    await fs.access(path.join(CACHE_DIR, filename));
+    const resolvedPath = await fs.realpath(filepath);
+    if (!resolvedPath.startsWith(CACHE_DIR)) {
+      return false;
+    }
+    await fs.access(resolvedPath);
     return true;
   } catch {
     return false;

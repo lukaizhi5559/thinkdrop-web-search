@@ -47,8 +47,8 @@ app.get('/images/:filename', async (req, res) => {
     if (!exists) {
       return res.status(404).send('Image not found');
     }
-    
-    const filepath = getCachePath(filename);
+
+    const filepath = await getCachePath(filename);
     
     // Determine content type from extension
     const ext = path.extname(filename).toLowerCase();

@@ -46,6 +46,9 @@ async function searchWithFallback(query, options = {}) {
   const explanation = explainIntent(query, intent);
   console.log(`🎯 Step 1: Detected intent: ${intent} - ${explanation}`);
   console.log(`📝 Query: "${query}" → Enhanced: "${enhancedQuery}"`);
+
+  // Update query for cache key to use enhanced version (consistent with search)
+  const effectiveQuery = enhancedQuery;
   
   // Try the appropriate Brave API based on intent
   try {
@@ -54,28 +57,28 @@ async function searchWithFallback(query, options = {}) {
     switch (intent) {
       case 'rich':
         console.log('💰 Trying Brave Rich Search (prices, weather, calculations)...');
-        braveResult = await searchBraveRich(enhancedQuery, options);
+        braveResult = await searchBraveRich(effectiveQuery, options);
         break;
       
       case 'news':
         console.log('📰 Trying Brave News Search (current events)...');
-        braveResult = await searchBraveNews(enhancedQuery, options);
+        braveResult = await searchBraveNews(effectiveQuery, options);
         break;
       
       case 'video':
         console.log('🎬 Trying Brave Video Search (movies, shows, tutorials)...');
-        braveResult = await searchBraveVideo(enhancedQuery, options);
+        braveResult = await searchBraveVideo(effectiveQuery, options);
         break;
       
       case 'image':
         console.log('🖼️  Trying Brave Image Search (pictures, photos)...');
-        braveResult = await searchBraveImage(enhancedQuery, options);
+        braveResult = await searchBraveImage(effectiveQuery, options);
         break;
       
       case 'web':
       default:
         console.log('🌐 Trying Brave Web Search (general queries)...');
-        braveResult = await searchBraveWeb(enhancedQuery, options);
+        braveResult = await searchBraveWeb(effectiveQuery, options);
         break;
     }
     
@@ -94,7 +97,7 @@ async function searchWithFallback(query, options = {}) {
   if (intent !== 'web') {
     try {
       console.log('🌐 Step 2: Fallback to Brave Web Search...');
-      const braveWebResult = await searchBraveWeb(enhancedQuery, options);
+      const braveWebResult = await searchBraveWeb(effectiveQuery, options);
       
       if (braveWebResult.results && braveWebResult.results.length > 0) {
         console.log(`✅ Brave Web returned ${braveWebResult.results.length} results`);
@@ -109,7 +112,7 @@ async function searchWithFallback(query, options = {}) {
   // Step 3: Try DuckDuckGo (free, unlimited)
   try {
     console.log('🔍 Step 3: Trying DuckDuckGo (free provider)...');
-    const duckResult = await searchDuckDuckGo(enhancedQuery, options);
+    const duckResult = await searchDuckDuckGo(effectiveQuery, options);
     
     // Check if we got results
     if (duckResult.results && duckResult.results.length > 0) {
@@ -128,7 +131,7 @@ async function searchWithFallback(query, options = {}) {
   return {
     results: [{
       title: 'Search providers unavailable',
-      description: `I apologize, but I'm unable to search the web right now due to provider limitations. However, I can try to help answer your question: "${enhancedQuery}" based on my training data. Please note that my knowledge may be outdated and I cannot access real-time information.`,
+      description: `I apologize, but I'm unable to search the web right now due to provider limitations. However, I can try to help answer your question: "${effectiveQuery}" based on my training data. Please note that my knowledge may be outdated and I cannot access real-time information.`,
       url: '',
       provider: 'llm-fallback',
       score: 0

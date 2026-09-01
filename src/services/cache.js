@@ -73,6 +73,22 @@ export async function setCachedResult(cacheKey, data, ttl) {
     return;
   }
 
+  // Don't cache failure responses — they poison subsequent queries for 24h.
+  // The LLM fallback returns a single "Search providers unavailable" result
+  // with an empty URL. Caching this means every query for the next 24 hours
+  // returns the fake failure, breaking app-knowledge research entirely.
+  if (data.provider === 'llm-fallback') {
+    console.log('⏭️  Skipping cache for llm-fallback response (failure)');
+    return;
+  }
+  if (data.results && data.results.length === 1) {
+    const r = data.results[0];
+    if (!r.url || r.provider === 'llm-fallback' || (r.title || '').includes('Search providers unavailable')) {
+      console.log('⏭️  Skipping cache for failure response (no valid URL)');
+      return;
+    }
+  }
+
   return new Promise((resolve, reject) => {
     const conn = getConnection();
     const id = `cache_${Date.now()}_${uuidv4().substring(0, 8)}`;

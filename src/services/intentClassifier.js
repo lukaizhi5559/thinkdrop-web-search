@@ -194,8 +194,8 @@ const QUERY_PATTERNS = {
     ],
     
     patterns: [
-      /(?:show|find|get|search) (?:me )?(?:images?|pictures?|photos?)/i,
-      /(?:images?|pictures?|photos?) of/i,
+      /(?:show|find|get|search|display|see) (?:me )?(?:some )?(?:images?|pictures?|photos?|pics?)\b/i,
+      /(?:images?|pictures?|photos?|pics?) of/i,
       /what does .+ look like/i,
       /(?:logo|icon|symbol) (?:of|for)/i,
       /picture of/i,

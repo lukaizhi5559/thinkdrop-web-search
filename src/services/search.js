@@ -126,18 +126,23 @@ async function searchWithFallback(query, options = {}) {
     lastError = error;
   }
   
-  // Step 4: All providers failed - return LLM fallback response
+  // Step 4: All providers failed - return LLM fallback response.
+  // Return an EMPTY results array with a `fallback` message rather than a
+  // URL-less pseudo-result. Downstream consumers (web.agent.searchWeb) filter
+  // URL-less results, so a pseudo-result with url:'' would be dropped anyway —
+  // but returning it as a real result caused `best= score=0` selections in
+  // web.agent before the URL filter was added. The `fallback` field lets the
+  // MCP route/answer path surface a graceful "search unavailable" message
+  // without polluting the results array.
   console.log('🤖 All search providers failed, returning LLM fallback response');
   return {
-    results: [{
+    results: [],
+    total: 0,
+    provider: 'llm-fallback',
+    fallback: {
       title: 'Search providers unavailable',
       description: `I apologize, but I'm unable to search the web right now due to provider limitations. However, I can try to help answer your question: "${effectiveQuery}" based on my training data. Please note that my knowledge may be outdated and I cannot access real-time information.`,
-      url: '',
-      provider: 'llm-fallback',
-      score: 0
-    }],
-    total: 1,
-    provider: 'llm-fallback',
+    },
     fallbackReason: lastError?.message || 'All search providers failed or returned empty results'
   };
 }

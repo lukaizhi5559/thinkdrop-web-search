@@ -470,70 +470,52 @@ export async function searchBraveImage(query, options = {}) {
     // Filter to only accessible images before downloading
     const accessibleResults = await filterAccessibleImages(rawResults, options.maxResults || 10);
 
-    // Download images to local cache and serve from there
-    // This avoids hotlinking issues with Getty, Pinterest, etc.
-    const results = await Promise.all(
-      accessibleResults.map(async (image) => {
-        // Try multiple sources for the image
-        const thumbnailUrl = image.thumbnail?.src;
-        const originalUrl = image.properties?.url;
-        const pageUrl = image.url;
-        
-        // Try to download: thumbnail first, then original
-        let cachedFilename = null;
-        let sourceUrl = null;
-        
-        // Try thumbnail
-        if (thumbnailUrl) {
-          cachedFilename = await downloadImage(thumbnailUrl);
-          if (cachedFilename) {
-            sourceUrl = thumbnailUrl;
-          }
-        }
-        
-        // Fallback to original URL
-        if (!cachedFilename && originalUrl) {
-          cachedFilename = await downloadImage(originalUrl);
-          if (cachedFilename) {
-            sourceUrl = originalUrl;
-          }
-        }
-        
-        // Build local URL if we have a cached file
-        // Use custom protocol for reliable local image serving
-        const localUrl = cachedFilename 
-          ? `thinkdrop-image://${cachedFilename}`
-          : null;
-        
-        return {
-          title: image.title,
-          description: image.description,
-          // Keep original page URL for context
-          url: pageUrl,
-          source: image.source,
-          type: 'image-result',
-          relevanceScore: image.relevanceScore,
-          metadata: {
-            thumbnail: image.thumbnail,
-            properties: {
-              // Use local URL as primary - always loads reliably
-              url: localUrl || thumbnailUrl || originalUrl,
-              // Store original for reference/click-to-view
-              originalUrl: originalUrl,
-              // Store if we have a cached version
-              cached: !!cachedFilename,
-              cachedFilename: cachedFilename,
-              width: image.properties?.width,
-              height: image.properties?.height,
-              format: image.properties?.format
-            }
-          }
-        };
-      })
-    );
+    // Return results immediately with original URLs — download to cache in the
+    // background. Blocking the response on downloading all images caused the
+    // web.agent searchWeb 8s timeout to fire (5 images × ~2s each = >8s).
+    // The cache is for the renderer's thumbnail display; find_download and
+    // other web.agent consumers only need the URL (they curl it directly).
+    const results = accessibleResults.map((image) => {
+      const thumbnailUrl = image.thumbnail?.src;
+      const originalUrl = image.properties?.url;
+      const pageUrl = image.url;
 
-    const cachedCount = results.filter(r => r.metadata.properties.cached).length;
-    console.log(`[BraveImage] Downloaded ${cachedCount}/${results.length} images to cache`);
+      // Fire-and-forget background download — don't block the HTTP response.
+      // Try thumbnail first, then original URL (matches the old sequential logic).
+      if (thumbnailUrl) {
+        downloadImage(thumbnailUrl).then((cachedFilename) => {
+          if (!cachedFilename && originalUrl) downloadImage(originalUrl).catch(() => {});
+        }).catch(() => {});
+      } else if (originalUrl) {
+        downloadImage(originalUrl).catch(() => {});
+      }
+
+      return {
+        title: image.title,
+        description: image.description,
+        // Keep original page URL for context
+        url: pageUrl,
+        source: image.source,
+        type: 'image-result',
+        relevanceScore: image.relevanceScore,
+        metadata: {
+          thumbnail: image.thumbnail,
+          properties: {
+            // Use the original URL — the cached version will be available on
+            // subsequent requests once the background download completes.
+            url: thumbnailUrl || originalUrl,
+            originalUrl: originalUrl,
+            cached: false, // downloading in background
+            cachedFilename: null,
+            width: image.properties?.width,
+            height: image.properties?.height,
+            format: image.properties?.format
+          }
+        }
+      };
+    });
+
+    console.log(`[BraveImage] Returning ${results.length} results (cache downloads in background)`);
 
     return {
       results,

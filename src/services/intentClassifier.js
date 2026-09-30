@@ -125,9 +125,11 @@ const QUERY_PATTERNS = {
       // Video platforms
       'video', 'youtube', 'vimeo', 'tiktok', 'instagram reels', 'shorts',
       
-      // Movies & Shows
+      // Movies & Shows — NB: bare 'show' was removed: it collides with the
+      // imperative "show me X" and once routed "goto biblehub and show me
+      // genesis 1" to brave-video → 5/5 YouTube results for a page-read task.
       'movie', 'movies', 'film', 'films', 'cinema', 'theater', 'theatre',
-      'show', 'series', 'tv show', 'television', 'episode', 'season',
+      'series', 'tv show', 'television', 'episode', 'season',
       'documentary', 'docuseries',
       
       // Streaming
@@ -183,9 +185,11 @@ const QUERY_PATTERNS = {
       'diagram', 'chart', 'graph', 'infographic', 'visualization',
       'map', 'blueprint', 'sketch', 'design',
       
-      // Visual queries
+      // Visual queries — NB: bare verbs ('show me','display','view','see')
+      // were removed: they match ordinary page-read phrasing ("show me the
+      // chapter") with no image intent. The patterns below still require an
+      // explicit image noun (pictures/photos/diagram…), which is the real ask.
       'look like', 'looks like', 'appearance', 'visual', 'visually',
-      'show me', 'display', 'view', 'see',
       
       // Image search specific
       'gallery', 'album', 'collection', 'portfolio',
@@ -302,13 +306,14 @@ export function classifyQueryIntent(originalQuery) {
         scores[intent] += 2;
       }
       
-      // Individual word match (lower weight)
+      // Word-level credit only for single-word keywords — multi-word phrases
+      // leak connector words ('miles to km' gave the bare word 'to' a point in
+      // "goto to biblehub and show me genesis 1"), routing plain page reads to
+      // rich/video/image endpoints.
       const keywordWords = keywordLower.split(/\s+/);
-      keywordWords.forEach(word => {
-        if (queryWords.includes(word)) {
-          scores[intent] += 1;
-        }
-      });
+      if (keywordWords.length === 1 && queryWords.includes(keywordWords[0])) {
+        scores[intent] += 1;
+      }
     });
     
     // Pattern matching (weight: 5 points each - strongest signal)

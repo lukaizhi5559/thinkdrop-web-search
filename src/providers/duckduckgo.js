@@ -115,15 +115,16 @@ async function searchDuckDuckGoLite(query, options = {}) {
     const results = [];
     const maxResults = options.maxResults || 10;
 
-    // Parse Lite version - simpler structure
-    const linkPattern = /<a rel=['"]nofollow['"] class=['"]result-link['"] href=['"]([^'"]+)['"]>([^<]+)<\/a>[\s\S]*?<td class=['"]result-snippet['"]>([^<]+)</g;
-    
+    // Parse Lite version — attribute order and extra classes vary, so capture
+    // the full attrs blob first, then pull href out of it.
+    const linkPattern = /<a\s+([^>]*class=['"][^'"]*result-link[^'"]*['"][^>]*)>([\s\S]*?)<\/a>[\s\S]*?<td\s+class=['"]result-snippet['"][^>]*>([\s\S]*?)<\/td>/g;
+
     let match;
     let count = 0;
     while ((match = linkPattern.exec(html)) !== null && count < maxResults) {
-      const url = match[1];
-      const title = decodeHTMLEntities(match[2].trim());
-      const description = decodeHTMLEntities(match[3].trim());
+      const url = (match[1].match(/href=['"]([^'"]+)['"]/) || [])[1] || '';
+      const title = decodeHTMLEntities(match[2].replace(/<[^>]+>/g, '').trim());
+      const description = decodeHTMLEntities(match[3].replace(/<[^>]+>/g, '').trim());
 
       if (url && title) {
         results.push({

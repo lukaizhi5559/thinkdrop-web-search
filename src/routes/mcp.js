@@ -3,6 +3,7 @@ import { search, searchNewsOnly } from '../services/search.js';
 import { crawlUrl, crawlUrls } from '../services/crawl.js';
 import { getCacheStats } from '../services/cache.js';
 import { getMetrics, incrementRequestCount, incrementSearchCount, incrementErrorCount, recordResponseTime } from '../services/metrics.js';
+import { searchBrowser } from '../services/searchBrowserDriver.js';
 
 const router = express.Router();
 
@@ -51,6 +52,10 @@ router.post('/web.search', async (req, res) => {
       maxResults: payload.maxResults || 10,
       filters: payload.filters,
       language: payload.language || 'en',
+      // lang = SERP locale steering (hl/setlang/kl); intent = stategraph media
+      // hint so the English regex classifier isn't the only path to image hops.
+      lang: payload.lang || null,
+      intent: payload.intent || null,
       sortBy: payload.sortBy,
       fromDate: payload.fromDate,
       toDate: payload.toDate
@@ -241,6 +246,8 @@ router.get('/service.health', async (req, res) => {
     // Check provider availability
     const braveAvailable = process.env.BRAVE_API_WEB_KEY ? 'available' : 'unavailable';
     const providers = {
+      'search-browser': searchBrowser.status(),
+      'browser-engine': searchBrowser.engine || 'none',
       duckduckgo: 'available',
       'brave-web': braveAvailable,
       'brave-rich': braveAvailable,

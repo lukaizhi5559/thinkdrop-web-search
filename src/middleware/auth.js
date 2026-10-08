@@ -5,8 +5,11 @@ dotenv.config();
 const API_KEY = process.env.API_KEY;
 
 export function authenticateRequest(req, res, next) {
-  // Skip auth for health and capabilities endpoints
-  if (req.path === '/service.health' || req.path === '/service.capabilities') {
+  // Skip auth for health and capabilities endpoints, and for the image-cache
+  // route — renderer <img src> tags cannot carry an Authorization header, and
+  // the route only serves opaque hashed filenames from a local dir.
+  if (req.path === '/service.health' || req.path === '/service.capabilities'
+      || req.path.startsWith('/images/')) {
     return next();
   }
 

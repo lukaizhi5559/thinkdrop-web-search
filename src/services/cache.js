@@ -99,8 +99,11 @@ export async function setCachedResult(cacheKey, data, ttl) {
     const query = data.query || 'unknown';
     const provider = data.provider || 'unknown';
 
-    // Use exec instead of run for better compatibility
-    const sql = `INSERT INTO search_cache (id, query, normalized_query, provider, results, expires_at)
+    // Upsert: without the delete, a second write for the same key (e.g. the
+    // post-enrichment rewrite) appends a new row while SELECT rows[0] keeps
+    // returning the older un-enriched one.
+    const sql = `DELETE FROM search_cache WHERE normalized_query = '${cacheKey.replace(/'/g, "''")}';
+                 INSERT INTO search_cache (id, query, normalized_query, provider, results, expires_at)
                  VALUES ('${id}', '${query.replace(/'/g, "''")}', '${cacheKey.replace(/'/g, "''")}', '${provider}', '${resultsJson.replace(/'/g, "''")}', '${expiresAt}')`;
     
     conn.exec(sql, (err) => {
@@ -122,6 +125,17 @@ export async function setCachedResult(cacheKey, data, ttl) {
         }
       );
     });
+  });
+}
+
+export async function deleteCachedResult(cacheKey) {
+  if (!CACHE_ENABLED) return;
+  return new Promise((resolve) => {
+    const conn = getConnection();
+    conn.exec(
+      `DELETE FROM search_cache WHERE normalized_query = '${cacheKey.replace(/'/g, "''")}'`,
+      () => resolve()
+    );
   });
 }
 

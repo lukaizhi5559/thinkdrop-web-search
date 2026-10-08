@@ -9,6 +9,21 @@ import { authenticateRequest } from './middleware/auth.js';
 import { rateLimitMiddleware } from './middleware/rateLimit.js';
 import mcpRoutes from './routes/mcp.js';
 import { getCachePath, isCached } from './utils/imageCache.js';
+import { searchBrowser } from './services/searchBrowserDriver.js';
+
+// Push browser state transitions to the Electron overlay-control server so
+// GhostLayer can show a "Web search starting up…" pill (mirrors voice:state).
+const OVERLAY_CONTROL_URL = process.env.OVERLAY_CONTROL_URL || 'http://127.0.0.1:3010';
+async function pushBrowserState(state) {
+  try {
+    await fetch(`${OVERLAY_CONTROL_URL}/websearch/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state })
+    });
+  } catch (_) { /* overlay-control not up yet — non-fatal */ }
+}
+searchBrowser.on('state', pushBrowserState);
 
 // Load environment variables from service directory
 const __filename = fileURLToPath(import.meta.url);
@@ -103,6 +118,13 @@ async function start() {
     await initializeDatabase();
     console.log('Database initialized successfully');
 
+    // Launch the hidden Chrome search worker (non-blocking — first queries
+    // fall back to DDG while it warms up). State transitions push to the
+    // overlay-control server for the GhostLayer startup pill.
+    searchBrowser.start().then(r => {
+      if (!r.ok) console.warn('[SearchBrowser] initial launch:', r.reason);
+    });
+
     app.listen(PORT, HOST, () => {
       console.log(`
 ╔═══════════════════════════════════════════════════════╗
@@ -121,21 +143,19 @@ Available endpoints:
   - GET  /service.health   (Health check)
   - GET  /service.capabilities (Service info)
 
-Smart Routing Strategy:
-  1. Intent Classification - Detect query type
-  2. Route to appropriate Brave API:
-     • Rich Search (prices, weather, crypto)
-     • News Search (current events)
-     • Video Search (movies, tutorials)
-     • Image Search (pictures, photos)
-     • Web Search (general queries)
-  3. Fallback to Brave Web if needed
+Smart Routing Strategy (free, no API keys):
+  1. Intent Classification - Detect query type (regex, no LLM)
+  2. Google SERP via hidden Playwright Chrome
+     (AI Overview + organic links + news/video/image blocks)
+  3. Fallback to Bing SERP (same hidden Chrome)
   4. Fallback to DuckDuckGo (free, unlimited)
   5. LLM fallback response if all providers fail
+  (Brave APIs remain available via explicit provider= requests)
 
 Providers Status:
-  - Brave APIs: ${process.env.BRAVE_API_WEB_KEY ? '✓ Configured (Web, Rich, News, Video, Image)' : '✗ Not configured'}
+  - Search Browser: ${searchBrowser.status()}
   - DuckDuckGo: ✓ Always available (fallback)
+  - Brave APIs (explicit only): ${process.env.BRAVE_API_WEB_KEY ? '✓ Configured' : '✗ Not configured'}
   - NewsAPI: ${process.env.NEWSAPI_KEY ? '✓ Configured' : '✗ Not configured (optional)'}
 
 Server ready at http://${HOST}:${PORT}

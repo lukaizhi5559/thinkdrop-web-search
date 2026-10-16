@@ -58,6 +58,17 @@ function isFaviconJunk(results) {
   return thumbed.length >= 2 && thumbed.every(r => looksLikeIcon(r.thumbnail || r.imageUrl));
 }
 
+// Cached entries extracted before the breadcrumb-desc fix: descriptions that
+// are the SERP cite row ("Yelp https://www.yelp.com › …") instead of snippet
+// prose. Signature = raw https:// inside a description — real snippets never
+// contain URLs. Require half the described results to match so organic junk
+// doesn't hide behind legit meta descs ("Reddit · r/Chipotle 40+ comments").
+function isBreadcrumbJunk(results) {
+  const descs = (results || []).filter(r => r.description);
+  const junk = descs.filter(r => /https?:\/\//.test(r.description)).length;
+  return junk >= 2 && junk >= Math.ceil(descs.length * 0.5);
+}
+
 async function searchWithFallback(query, options = {}) {
   // If specific provider requested, use it directly
   if (options.provider && options.provider !== 'auto') {
@@ -226,7 +237,7 @@ export async function search(query, options = {}, context = {}) {
   // An image/video-intent entry containing zero media results predates the
   // extraction that produces them — evict and re-scrape.
   const missingMedia = mediaIntent && cached && !(cached.results || []).some(r => r.type === 'image' || r.type === 'image-result' || r.type === 'video');
-  if (cached && (missingMedia || isLoginWallJunk(cached.results) || (!mediaIntent && !resultsMatchQuery(query, cached.results)) || isFaviconJunk(cached.results))) {
+  if (cached && (missingMedia || isLoginWallJunk(cached.results) || (!mediaIntent && !resultsMatchQuery(query, cached.results)) || isFaviconJunk(cached.results) || isBreadcrumbJunk(cached.results))) {
     // Junk scraped before the guards existed (sign-in wall, or a degraded
     // query-agnostic SERP) — evict and fall through to a live search.
     console.warn(`🗑️  Evicting junk cache entry for "${query}"`);
@@ -256,6 +267,27 @@ export async function search(query, options = {}, context = {}) {
     };
   }
 
+  // In-flight dedupe: an express-lane timeout can trigger a stategraph retry
+  // of the SAME query — joining one execution beats launching a second
+  // (queue-serialized) navigation on the shared worker page and saves a
+  // human-rate pacing slot. Late callers await the same promise.
+  const pending = _pendingSearches.get(cacheKey);
+  if (pending) {
+    console.log(`🔗 Joining in-flight search for "${query}"`);
+    return pending;
+  }
+  const execution = _executeAndCache(query, options, context, cacheKey, startTime);
+  _pendingSearches.set(cacheKey, execution);
+  try {
+    return await execution;
+  } finally {
+    _pendingSearches.delete(cacheKey);
+  }
+}
+
+const _pendingSearches = new Map(); // cacheKey -> Promise<searchResult>
+
+async function _executeAndCache(query, options, context, cacheKey, startTime) {
   // Execute search with fallback
   const searchResult = await searchWithFallback(query, options);
   const elapsedMs = Date.now() - startTime;

@@ -262,18 +262,85 @@ function extractSerp(opts = {}) {
     const a = h3.closest('a');
     if (!a || !a.href || seen.has(a.href)) continue;
     seen.add(a.href);
+    // Snippet text lives in a sibling div one ancestor up from the anchor;
+    // the cite row ("Yelp https://www.yelp.com › …") plus title already pass
+    // a naive >40-char test, so the climb must filter junk lines out of BOTH
+    // the break test and the kept text — otherwise desc is breadcrumb noise.
+    // Kept lines include rich-snippet prose ("Rating: 4.5 · 512 reviews").
+    const JUNK_RE = /https?:\/\/| › |^[\w.-]+\.(?:com|net|org|io|ai|app|co|dev|gov|edu|info|me|us|uk|de|fr|jp|au|ca)(?:[\s/]|$)/i;
+    // Real destination domain from the cite row — result hrefs are wrapped
+    // google.com/goto links (background-only unwrap), so hostname derived
+    // from r.url renders "google.com" downstream. Zero-latency alternative.
+    let displayDomain = '';
+    const cite = a.querySelector('cite');
+    const citeM = ((cite && cite.innerText) || a.innerText || '')
+      .match(/(?:https?:\/\/)?([\w.-]+\.(?:com|net|org|io|ai|app|co|dev|gov|edu|info|me|us|uk|de|fr|jp|au|ca|tv|gg|news|shop|store|site))\b/i);
+    if (citeM) displayDomain = citeM[1].replace(/^www\./, '').toLowerCase();
+    const h3t = h3.innerText.trim();
     let desc = '';
+    // Structured rich-snippet fields — collected from every scanned line so
+    // ratings/prices surface even when they sit beside (not inside) the
+    // snippet block the desc climb selects.
+    let rating, ratingMax, reviewCount, priceRange;
     let box = a.parentElement;
-    for (let i = 0; i < 4 && box; i++) {
-      const t = (box.innerText || '').replace(h3.innerText, '').trim();
-      if (t.length > 40) { desc = t.split('\n').filter(Boolean).slice(-2).join(' '); break; }
+    for (let i = 0; i < 6 && box; i++) {
+      const inner = box.innerText || '';
+      // A very wide box spans multiple results — its prose would concatenate
+      // neighbors' snippets. Stop climbing; keep the tighter-box fallback.
+      if (inner.length > 2500) break;
+      const lines = inner
+        .replace(h3.innerText, '')
+        .split('\n').map(l => l.trim()).filter(l => l && !JUNK_RE.test(l));
+      // Scan all lines for rating/price patterns before the prose cap —
+      // "3.1 ★ (4,472) · Price range: $" lines are non-junk and reach here.
+      for (const l of lines) {
+        if (rating === undefined) {
+          let m = l.match(/\b(\d+(?:\.\d+)?)\s*★/)           // "3.1 ★"
+               || l.match(/\brated\s+(\d+(?:\.\d+)?)\s+(?:of|out of)\s+(5|10)\b/i) // "rated 4.0 of 5"
+               || l.match(/\b(\d+(?:\.\d+)?)\s*\/\s*(5|10)\b/)                    // "4.0/5"
+               || l.match(/\b(\d+(?:\.\d+)?)\s*\(([\d,]+)\s*(?:reviews?|ratings?)\)/) // "1.5 (35 reviews)"
+               || l.match(/\b(\d+(?:\.\d+)?)\s*stars?\b/i);                       // "3.5 stars"
+          if (m) {
+            rating = parseFloat(m[1]);
+            // m[2] is the max for "of N"/"/N" patterns but the review count
+            // for "(N reviews)" — only accept small values as a max.
+            const g2 = m[2] ? parseInt(m[2].replace(/,/g, ''), 10) : NaN;
+            ratingMax = (g2 >= 1 && g2 <= 10) ? g2 : 5;
+            if (g2 > 10 && reviewCount === undefined) reviewCount = g2;
+          } else if (/^★{2,5}☆{0,3}/.test(l)) {
+            rating = (l.match(/★/g) || []).length;
+            ratingMax = rating + (l.match(/☆/g) || []).length;
+          }
+        }
+        if (reviewCount === undefined) {
+          const m = l.match(/\(?([\d,]+)\+?\)?\s*(?:reviews?|ratings?|comments?|votes?)\b/i)
+                 || l.match(/\b(?:reviews?:?)\s*\(?([\d,]+)\)?/i);
+          if (m) reviewCount = parseInt(m[1].replace(/,/g, ''), 10);
+        }
+        if (priceRange === undefined) {
+          const m = l.match(/price\s*range:?\s*(\${1,4})/i) || l.match(/(?:·|\s)(\${2,4})\b/);
+          if (m) priceRange = m[1];
+        }
+      }
+      // First non-junk lines are ours in DOM order — cap at 3 so a wide box
+      // can't smear the next result's snippet into this one.
+      const prose = lines.slice(0, 3).join(' ');
+      if (prose.length > 40) { desc = prose.slice(0, 400); break; }
+      // Shorter junk-free lines (e.g. a bare "Rating: 4.2") stay as fallback
+      // if the climb never reaches a real snippet block.
+      if (lines.length && !desc) desc = lines.slice(0, 3).join(' ').slice(0, 300);
       box = box.parentElement;
     }
+    if (desc === h3t) desc = '';
     const img = biggestImg(a);
     out.results.push({
       title: h3.innerText.trim(),
       url: a.href,
       description: desc,
+      ...(displayDomain && { displayDomain }),
+      ...(rating !== undefined && { rating, ratingMax }),
+      ...(reviewCount !== undefined && { reviewCount }),
+      ...(priceRange && { priceRange }),
       thumbnail: img ? (img.src || undefined) : undefined,
       type: VIDEO_HOSTS.test(a.href) ? 'video' : 'web-result'
     });

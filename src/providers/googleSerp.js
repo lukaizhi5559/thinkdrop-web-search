@@ -158,21 +158,107 @@ function extractSerp(opts = {}) {
     'обзор от ии',                          // ru
   ]);
   const cleanAiText = (t) => t
-    .replace(/^AI (Overview|Mode)[^\n]*\n?/i, '')
+    .replace(/^#{0,6}\s*AI (Overview|Mode)[^\n]*\n?/i, '')
+    .replace(/^#{0,6}\s*AI (Overview|Mode)\s*$/im, '')
+    // "+N" citation chips concatenated into prose by innerText (the DOM→md
+    // path already converts them to [n] markers — this catches the fallback).
+    .replace(/ ?\+\d{1,2}(?=\s|$)/gm, '')
     .split('\n')
     .map(l => l.trim())
-    .filter((l, i) => !(i === 0 && AI_OVERVIEW_LABELS.has(l.toLowerCase())))
+    .filter(l => !AI_OVERVIEW_LABELS.has(l.replace(/^#{1,6}\s*/, '').toLowerCase()))
     .filter(l => l && !/[{;}]|function\s*\(|window\.|try\s*\{|\.rll\(|var |const |=>/.test(l)
              && !/^(show more|show less|all|images|videos|news|more|tools)$/i.test(l))
     .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
     .slice(0, 3000)
     .trim();
+  // Translate the overview's native DOM into markdown — headings, lists,
+  // tables, bold, and real links survive; innerText flattens all of it and
+  // concatenates "+N" citation chips into the prose. Citation chips/sup
+  // become bare [n] markers (their hrefs are google-internal scroll/goto
+  // URLs — the real sources surface in the result cards).
+  const SKIP_MD = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','CANVAS','IFRAME','BUTTON','SELECT','INPUT','TEXTAREA','FORM','AUDIO','VIDEO','TEMPLATE','NAV']);
+  const BLOCK_MD = new Set(['P','DIV','SECTION','ARTICLE','MAIN','HEADER','FOOTER','UL','OL','LI','TABLE','THEAD','TBODY','TR','H1','H2','H3','H4','H5','H6','BLOCKQUOTE','PRE','HR','DL','DT','DD','FIGURE','DETAILS','SUMMARY']);
+  const mdInline = (node) => {
+    let s = '';
+    for (const c of node.childNodes || []) {
+      if (c.nodeType === 3) { s += c.nodeValue; continue; }
+      if (c.nodeType !== 1 || SKIP_MD.has(c.tagName)) continue;
+      const t = (c.textContent || '').trim();
+      if (!t) continue;
+      if (/^\+\d{1,2}$/.test(t)) { s += ` [${t.slice(1)}]`; continue; }
+      if (c.tagName === 'SUP' && /^\[?\d{1,2}\]?$/.test(t)) { s += ` [${t.replace(/\D/g, '')}]`; continue; }
+      if (c.tagName === 'BR') { s += '  \n'; continue; }
+      if (c.tagName === 'A') {
+        const href = c.href || '';
+        const label = mdInline(c).trim() || t;
+        s += (href && /^https?:/.test(href) && !isGoogleUrl(href)) ? ` [${label}](${href})` : ` ${label}`;
+        continue;
+      }
+      if (c.tagName === 'STRONG' || c.tagName === 'B') { s += ` **${mdInline(c).trim() || t}**`; continue; }
+      if (c.tagName === 'EM' || c.tagName === 'I') { s += ` *${mdInline(c).trim() || t}*`; continue; }
+      if (c.tagName === 'CODE') { s += ` \`${t}\``; continue; }
+      s += mdInline(c);
+    }
+    return s;
+  };
+  const mdItem = (li) => {
+    const parts = [];
+    let nested = '';
+    for (const c of li.childNodes || []) {
+      if (c.nodeType === 3) parts.push(c.nodeValue);
+      else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName)) {
+        if (c.tagName === 'UL' || c.tagName === 'OL') {
+          const items = [...c.children].filter(x => x.tagName === 'LI');
+          nested += '\n' + items.map((x, i) => `  ${c.tagName === 'OL' ? `${i + 1}.` : '-'} ${mdItem(x)}`).join('\n');
+        } else parts.push(mdInline(c));
+      }
+    }
+    return parts.join('').replace(/\s+/g, ' ').trim() + nested;
+  };
+  const mdTable = (tbl) => {
+    const body = [...tbl.querySelectorAll('tr')]
+      .map(tr => [...tr.querySelectorAll('th,td')].map(c => mdInline(c).trim().replace(/\|/g, '\\|').replace(/\s+/g, ' ')))
+      .filter(r => r.some(c => c));
+    if (!body.length) return '';
+    const sep = body[0].map(() => '---');
+    return [body[0], sep, ...body.slice(1)].map(r => `| ${r.join(' | ')} |`).join('\n') + '\n\n';
+  };
+  const mdBlocks = (el) => {
+    let out = '';
+    const direct = [];
+    for (const c of el.childNodes || []) {
+      if (c.nodeType === 3) direct.push(c.nodeValue);
+      else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName) && !BLOCK_MD.has(c.tagName)) direct.push(mdInline(c));
+    }
+    const lead = direct.join('').replace(/\s+/g, ' ').trim();
+    if (lead) out += lead + '\n\n';
+    for (const c of el.children || []) {
+      const tag = c.tagName;
+      if (SKIP_MD.has(tag) || !(c.textContent || '').trim()) continue;
+      if (/^H[1-6]$/.test(tag)) { const t = mdInline(c).trim(); if (t) out += `${'#'.repeat(+tag[1])} ${t}\n\n`; continue; }
+      if (tag === 'UL' || tag === 'OL') {
+        const items = [...c.children].filter(li => li.tagName === 'LI');
+        if (items.length) out += items.map((li, i) => `${tag === 'OL' ? `${i + 1}.` : '-'} ${mdItem(li)}`).join('\n') + '\n\n';
+        continue;
+      }
+      if (tag === 'TABLE') { out += mdTable(c); continue; }
+      if (tag === 'BLOCKQUOTE') { const t = mdInline(c).trim(); if (t) out += `> ${t}\n\n`; continue; }
+      if (tag === 'PRE') { out += '```\n' + (c.textContent || '').trim() + '\n```\n\n'; continue; }
+      if (tag === 'HR') { out += '---\n\n'; continue; }
+      if (BLOCK_MD.has(tag)) { out += mdBlocks(c); continue; }
+      const t = mdInline(c).trim();
+      if (t) out += t + '\n\n';
+    }
+    return out;
+  };
   for (const h of document.querySelectorAll('h1, h2, h3, div[role="heading"], strong')) {
     const hl = txt(h).trim().toLowerCase();
     if (AI_OVERVIEW_LABELS.has(hl)) {
       let node = h.parentElement;
       for (let i = 0; i < 6 && node; i++) {
-        const t = cleanAiText(node.innerText || '');
+        const md = mdBlocks(node).trim();
+        const t = cleanAiText(md.length > 40 ? md : (node.innerText || ''));
         if (t.length > 80) { out.aiOverview = t; break; }
         node = node.parentElement;
       }

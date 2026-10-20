@@ -35,11 +35,94 @@ function extractSerp() {
     return out;
   }
 
+  // DOM→markdown walker for the answer container — mirrors googleSerp's:
+  // innerText flattens headings/lists/bold and concatenates citation chips;
+  // the DOM still carries the structure. Bing wraps outbound links as
+  // /ck/a?... — emit label-only for those (the organic results carry the
+  // decoded URLs); real http(s) links become [text](href).
+  const SKIP_MD = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','CANVAS','IFRAME','BUTTON','SELECT','INPUT','TEXTAREA','FORM','AUDIO','VIDEO','TEMPLATE','NAV']);
+  const BLOCK_MD = new Set(['P','DIV','SECTION','ARTICLE','MAIN','HEADER','FOOTER','UL','OL','LI','TABLE','THEAD','TBODY','TR','H1','H2','H3','H4','H5','H6','BLOCKQUOTE','PRE','HR','DL','DT','DD','FIGURE','DETAILS','SUMMARY']);
+  const isWrappedUrl = (u) => { try { const x = new URL(u); return x.hostname.endsWith('bing.com') && x.pathname.startsWith('/ck/'); } catch (_) { return false; } };
+  const mdInline = (node) => {
+    let s = '';
+    for (const c of node.childNodes || []) {
+      if (c.nodeType === 3) { s += c.nodeValue; continue; }
+      if (c.nodeType !== 1 || SKIP_MD.has(c.tagName)) continue;
+      const t = (c.textContent || '').trim();
+      if (!t) continue;
+      if (/^\+\d{1,2}$/.test(t)) { s += ` [${t.slice(1)}]`; continue; }
+      if (c.tagName === 'SUP' && /^\[?\d{1,2}\]?$/.test(t)) { s += ` [${t.replace(/\D/g, '')}]`; continue; }
+      if (c.tagName === 'BR') { s += '  \n'; continue; }
+      if (c.tagName === 'A') {
+        const href = c.href || '';
+        const label = mdInline(c).trim() || t;
+        s += (href && /^https?:/.test(href) && !isWrappedUrl(href)) ? ` [${label}](${href})` : ` ${label}`;
+        continue;
+      }
+      if (c.tagName === 'STRONG' || c.tagName === 'B') { s += ` **${mdInline(c).trim() || t}**`; continue; }
+      if (c.tagName === 'EM' || c.tagName === 'I') { s += ` *${mdInline(c).trim() || t}*`; continue; }
+      if (c.tagName === 'CODE') { s += ` \`${t}\``; continue; }
+      s += mdInline(c);
+    }
+    return s;
+  };
+  const mdItem = (li) => {
+    const parts = [];
+    let nested = '';
+    for (const c of li.childNodes || []) {
+      if (c.nodeType === 3) parts.push(c.nodeValue);
+      else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName)) {
+        if (c.tagName === 'UL' || c.tagName === 'OL') {
+          const items = [...c.children].filter(x => x.tagName === 'LI');
+          nested += '\n' + items.map((x, i) => `  ${c.tagName === 'OL' ? `${i + 1}.` : '-'} ${mdItem(x)}`).join('\n');
+        } else parts.push(mdInline(c));
+      }
+    }
+    return parts.join('').replace(/\s+/g, ' ').trim() + nested;
+  };
+  const mdTable = (tbl) => {
+    const body = [...tbl.querySelectorAll('tr')]
+      .map(tr => [...tr.querySelectorAll('th,td')].map(c => mdInline(c).trim().replace(/\|/g, '\\|').replace(/\s+/g, ' ')))
+      .filter(r => r.some(c => c));
+    if (!body.length) return '';
+    const sep = body[0].map(() => '---');
+    return [body[0], sep, ...body.slice(1)].map(r => `| ${r.join(' | ')} |`).join('\n') + '\n\n';
+  };
+  const mdBlocks = (el) => {
+    let buf = '';
+    const direct = [];
+    for (const c of el.childNodes || []) {
+      if (c.nodeType === 3) direct.push(c.nodeValue);
+      else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName) && !BLOCK_MD.has(c.tagName)) direct.push(mdInline(c));
+    }
+    const lead = direct.join('').replace(/\s+/g, ' ').trim();
+    if (lead) buf += lead + '\n\n';
+    for (const c of el.children || []) {
+      const tag = c.tagName;
+      if (SKIP_MD.has(tag) || !(c.textContent || '').trim()) continue;
+      if (/^H[1-6]$/.test(tag)) { const t = mdInline(c).trim(); if (t) buf += `${'#'.repeat(+tag[1])} ${t}\n\n`; continue; }
+      if (tag === 'UL' || tag === 'OL') {
+        const items = [...c.children].filter(li => li.tagName === 'LI');
+        if (items.length) buf += items.map((li, i) => `${tag === 'OL' ? `${i + 1}.` : '-'} ${mdItem(li)}`).join('\n') + '\n\n';
+        continue;
+      }
+      if (tag === 'TABLE') { buf += mdTable(c); continue; }
+      if (tag === 'BLOCKQUOTE') { const t = mdInline(c).trim(); if (t) buf += `> ${t}\n\n`; continue; }
+      if (tag === 'PRE') { buf += '```\n' + (c.textContent || '').trim() + '\n```\n\n'; continue; }
+      if (tag === 'HR') { buf += '---\n\n'; continue; }
+      if (BLOCK_MD.has(tag)) { buf += mdBlocks(c); continue; }
+      const t = mdInline(c).trim();
+      if (t) buf += t + '\n\n';
+    }
+    return buf;
+  };
+
   // Copilot generative answer first, then classic answer box.
   const copilot = document.querySelector('#b_sydConvCont, .b_sydText, #b_chat');
   const ans = copilot || document.querySelector('.b_ans, .b_entityTP, [data-tag="AnswerBox"]');
   if (ans) {
-    const t = txt(ans);
+    const md = mdBlocks(ans).trim().replace(/\n{3,}/g, '\n\n');
+    const t = md.length > 40 ? md : txt(ans);
     if (t.length > 40) out.answer = t.slice(0, 3000);
   }
 

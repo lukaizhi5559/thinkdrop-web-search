@@ -304,9 +304,22 @@ async function _executeAndCache(query, options, context, cacheKey, startTime) {
 
   // Background enrichment (URL unwrap, oEmbed titles) — providers return an
   // optional _enrich hook; when it completes, overwrite the cache so the
-  // next identical query gets the enriched copy. Response is already sent.
+  // next identical query gets the enriched copy.
+  // When the response would ship google.com/goto redirect links to the UI,
+  // await the enrich for a bounded window (~1.8s) so the FIRST response
+  // carries unwrapped URLs too — stragglers still land via the cache
+  // overwrite below. No wrapped links → zero added latency.
   if (typeof searchResult._enrich === 'function') {
-    searchResult._enrich().then(async (enriched) => {
+    const hasWrapped = (searchResult.results || []).some(r => /google\.com\/goto/.test(r?.url || ''));
+    const enrichP = searchResult._enrich();
+    if (hasWrapped) {
+      const enriched = await Promise.race([
+        enrichP,
+        new Promise(res => setTimeout(() => res(null), 1800)),
+      ]).catch(() => null);
+      if (enriched) searchResult.results = enriched;
+    }
+    enrichP.then(async (enriched) => {
       try {
         await setCachedResult(cacheKey, {
           query,

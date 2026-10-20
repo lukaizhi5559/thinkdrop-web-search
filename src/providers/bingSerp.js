@@ -111,8 +111,8 @@ function extractSerp() {
       if (tag === 'PRE') { buf += '```\n' + (c.textContent || '').trim() + '\n```\n\n'; continue; }
       if (tag === 'HR') { buf += '---\n\n'; continue; }
       if (BLOCK_MD.has(tag)) { buf += mdBlocks(c); continue; }
-      const t = mdInline(c).trim();
-      if (t) buf += t + '\n\n';
+      // Non-block inline children were already collected into `lead` above —
+      // emitting them again explodes token spans into one line each.
     }
     return buf;
   };

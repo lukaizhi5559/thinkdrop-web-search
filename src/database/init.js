@@ -81,8 +81,27 @@ export function initializeDatabase() {
         }
 
         console.log('Database tables created successfully');
-        db.close();
-        resolve();
+
+        // Startup sweep: evict long-TTL cache rows written by fallback
+        // providers on the auto chain. Rows cached during a primary-outage
+        // window kept serving degraded SERPs for up to 24h after recovery
+        // (observed: Bing "percentage calculator" spam surviving a Google
+        // SERP fix). Fallback writes now carry a 10-min TTL cap, so any row
+        // with >10 min remaining was written pre-fix. Explicit-provider
+        // rows ("provider":"bing-serp" etc. in the normalized key) are kept.
+        const cutoff = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+        connection.exec(`
+          DELETE FROM search_cache
+          WHERE normalized_query NOT LIKE '%|v2'
+             OR (provider IN ('bing-serp', 'duckduckgo', 'searxng')
+                 AND expires_at > TIMESTAMP '${cutoff}'
+                 AND (normalized_query NOT LIKE '%"provider":%'
+                      OR normalized_query LIKE '%"provider":"auto"%'));
+        `, (sweepErr) => {
+          if (sweepErr) console.warn('Cache sweep failed (non-fatal):', sweepErr.message);
+          db.close();
+          resolve();
+        });
       });
     });
   });

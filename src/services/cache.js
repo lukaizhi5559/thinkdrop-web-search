@@ -5,10 +5,15 @@ const CACHE_ENABLED = process.env.CACHE_ENABLED !== 'false';
 const CACHE_TTL_TIME_SENSITIVE = parseInt(process.env.CACHE_TTL_TIME_SENSITIVE) || 600000; // 10 minutes
 const CACHE_TTL_GENERAL = parseInt(process.env.CACHE_TTL_GENERAL) || 86400000; // 24 hours
 
+// Cache-key format version — bump when the stored payload shape or provider
+// output format changes so pre-change rows simply never match (e.g. the
+// Copilot markdown cleanup made all earlier bing-copilot entries stale).
+const CACHE_KEY_VERSION = 'v2';
+
 export function normalizeQuery(query, params = {}) {
   const normalized = query.toLowerCase().trim().replace(/\s+/g, ' ');
   const paramStr = JSON.stringify(params);
-  return `${normalized}|${paramStr}`;
+  return `${normalized}|${paramStr}|${CACHE_KEY_VERSION}`;
 }
 
 export function getCacheTTL(query, params = {}) {

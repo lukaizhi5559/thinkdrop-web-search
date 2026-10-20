@@ -47,6 +47,39 @@ router.post('/web.search', async (req, res) => {
 
     incrementSearchCount();
 
+    // stream:true → SSE: data:{type:'answer',text} deltas while the provider
+    // generates (Bing Copilot answers stream progressively), then
+    // data:{type:'done',data:{fullResult}}. Plain JSON otherwise.
+    if (payload.stream === true) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      const emit = (obj) => { try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch (_) {} };
+      try {
+        const result = await search(payload.query, {
+          provider: payload.provider || 'auto',
+          maxResults: payload.maxResults || 10,
+          filters: payload.filters,
+          language: payload.language || 'en',
+          lang: payload.lang || null,
+          intent: payload.intent || null,
+          sortBy: payload.sortBy,
+          fromDate: payload.fromDate,
+          toDate: payload.toDate,
+          onAnswerChunk: (t) => emit({ type: 'answer', text: t }),
+        }, {
+          userId: context?.userId,
+          sessionId: context?.sessionId
+        });
+        emit({ type: 'done', data: result });
+      } catch (error) {
+        emit({ type: 'done', data: { error: error.message } });
+      }
+      return res.end();
+    }
+
     const result = await search(payload.query, {
       provider: payload.provider || 'auto',
       maxResults: payload.maxResults || 10,

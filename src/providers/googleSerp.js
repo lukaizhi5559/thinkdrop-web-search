@@ -11,6 +11,7 @@ import axios from 'axios';
 import { searchBrowser } from '../services/searchBrowserDriver.js';
 
 const AI_OVERVIEW_WAIT_MS = parseInt(process.env.SERP_AI_WAIT_MS) || 2000;
+const NAV_TIMEOUT_MS = parseInt(process.env.SEARCH_NAV_TIMEOUT_MS) || 15000;
 const GOOGLE_BLOCK_COOLDOWN_MS = parseInt(process.env.GOOGLE_BLOCK_COOLDOWN_MS) || 10 * 60 * 1000;
 const UNWRAP_CONCURRENCY = 5;
 
@@ -141,6 +142,25 @@ function extractSerp(opts = {}) {
       : 'captcha';
     return out;
   }
+  // In-page consent interstitial — "Before you continue to Google" renders
+  // ON google.com/search (no consent.google. redirect), so the checks above
+  // miss it; the SERP behind it never loads → organic extraction reads a
+  // wall as an empty page (observed: every query → "empty results").
+  const _consentForm = document.querySelector('form[action*="consent"], form[action*="ServiceLogin"]');
+  const _consentBtn = [...document.querySelectorAll('button, [role="button"], input[type="submit"]')]
+    .find(b => /^(accept all|i agree|agree|alle akzeptieren|tout accepter|aceptar todo|接受|同意)/i
+      .test((b.innerText || b.value || '').trim()));
+  if (_consentForm || (_consentBtn && /before you continue/i.test(bodyText))
+      || /before you continue to google/i.test(bodyText)) {
+    out.blocked = true;
+    out.blockReason = 'consent-interstitial';
+    return out;
+  }
+  // Empty-shell flag — a JS-required/lite stub page with no extractable
+  // content and no external anchors. Not blocked: gbv=1 recovery may work.
+  const _externalAnchors = [...document.querySelectorAll('a[href^="http"]')]
+    .filter(a => !isGoogleUrl(a.href)).length;
+  if (bodyText.length < 200 && _externalAnchors === 0) out.emptyShell = true;
 
   // ── 2. AI Overview ────────────────────────────────────────────────────
   // Locate the "AI Overview" heading (localized label set covers the languages
@@ -247,8 +267,8 @@ function extractSerp(opts = {}) {
       if (tag === 'PRE') { out += '```\n' + (c.textContent || '').trim() + '\n```\n\n'; continue; }
       if (tag === 'HR') { out += '---\n\n'; continue; }
       if (BLOCK_MD.has(tag)) { out += mdBlocks(c); continue; }
-      const t = mdInline(c).trim();
-      if (t) out += t + '\n\n';
+      // Non-block inline children were already collected into `lead` above —
+      // emitting them again explodes token spans into one line each.
     }
     return out;
   };
@@ -432,6 +452,49 @@ function extractSerp(opts = {}) {
     });
   }
 
+  // ── 4a-lite. Basic-HTML / lite-variant organic fallback ───────────────
+  // The gbv=1 SERP (and some JS-minimal variants served to headless engines)
+  // puts organic links in table cells as plain external anchors — no h3
+  // wrapper, so the pass above yields nothing (observed: every query →
+  // "empty results" while the page had real links). Scan the result
+  // containers (or the whole doc if they're absent) for external anchors.
+  if (out.results.length === 0) {
+    const scope = document.querySelector('#main, #search, #rso, #center_col, #topstuff') || document.body;
+    for (const a of (scope || document).querySelectorAll('a[href^="http"], a[href^="/url?"]')) {
+      let href = a.href || '';
+      try {
+        const u = new URL(href, location.origin);
+        if (u.pathname === '/url' && u.searchParams.get('q')) href = u.searchParams.get('q');
+        if (u.pathname === '/url' && u.searchParams.get('url')) href = u.searchParams.get('url');
+      } catch (_) {}
+      if (!href || seen.has(href) || isGoogleUrl(href)) continue;
+      const t = txt(a);
+      const title = (t.split('\n')[0] || '').trim();
+      if (title.length < 6) continue;
+      seen.add(href);
+      // Snippet prose: climb a few ancestors for the first non-junk lines.
+      const _JUNK_RE = /https?:\/\/| › |^[\w.-]+\.(?:com|net|org|io|ai|app|co|dev|gov|edu|info|me|us|uk|de|fr|jp|au|ca)(?:[\s/]|$)/i;
+      let desc = '';
+      let box = a.parentElement;
+      for (let i = 0; i < 5 && box; i++) {
+        const inner = (box.innerText || '').replace(t, '');
+        const lines = inner.split('\n').map(l => l.trim()).filter(l => l && !_JUNK_RE.test(l));
+        const prose = lines.slice(0, 3).join(' ');
+        if (prose.length > 40) { desc = prose.slice(0, 400); break; }
+        if (lines.length && !desc) desc = lines.slice(0, 3).join(' ').slice(0, 300);
+        box = box.parentElement;
+      }
+      out.results.push({
+        title: title.slice(0, 140),
+        url: href,
+        description: desc,
+        type: VIDEO_HOSTS.test(href) ? 'video' : 'web-result',
+        liteVariant: true
+      });
+      if (out.results.length >= 12) break;
+    }
+  }
+
   // ── 4b. Unlabeled-image fallback (image intent only) ──────────────────
   // Some SERPs inline photos with NO "Images" section heading — knowledge-
   // panel portraits, unlabeled carousels ("show me pics of the president").
@@ -450,6 +513,9 @@ function extractSerp(opts = {}) {
   // Diagnostics for "image intent but no images" cases — heading labels on
   // the page + every img's size signature so favicon/thumb failures are
   // visible without a live browser.
+  out.debug.title = document.title || '';
+  out.debug.url = location.href;
+  out.debug.bodyPeek = bodyText.slice(0, 300);
   out.debug.headings = [...document.querySelectorAll('h1,h2,h3,div[role="heading"],g-link,strong,span')]
     .map(h => (h.textContent || h.getAttribute?.('aria-label') || '').trim().toLowerCase())
     .filter(l => l && l.length < 40).slice(0, 60);
@@ -609,22 +675,91 @@ export async function searchGoogleSerp(query, options = {}) {
     throw new Error(`google-serp navigation failed: ${err.message}`);
   }
 
-  // AI Overview streams in after DOMContentLoaded — give it a bounded wait.
+  // Content streams in after DOMContentLoaded — wait for ANY extractable
+  // surface (organic anchors, an AI-Overview heading, or a block marker).
+  // The overview-only wait let extraction run against a still-empty DOM
+  // on slow renders, and gave no signal when Google served a lite/consent
+  // variant instead (observed: every query → 0 organic → Bing fallback).
   try {
     await page.waitForFunction(
       () => {
+        if (document.querySelector('a h3')) return true;
         const labels = ['ai overview', 'ai mode', 'ai 概览', 'ai概览', 'ai 概要', 'ai概要',
           'ai 개요', 'resumen de ia', 'descripción general de ia', 'présentation de l\'ia',
           'aperçu ia', 'aperçu de l\'ia', 'ki-übersicht', 'ki übersicht',
           'visão geral de ia', 'обзор от ии'];
-        return [...document.querySelectorAll('h1,h2,h3,div[role="heading"],strong')]
-          .some(h => labels.includes((h.textContent || '').trim().toLowerCase()));
+        if ([...document.querySelectorAll('h1,h2,h3,div[role="heading"],strong')]
+          .some(h => labels.includes((h.textContent || '').trim().toLowerCase()))) return true;
+        // Lite-variant SERP — external result anchors without h3 wrappers.
+        if ([...document.querySelectorAll('#main a[href^="http"], #search a[href^="http"], #rso a[href^="http"]')]
+          .some(a => { try { return !new URL(a.href).hostname.endsWith('google.com'); } catch (_) { return false; } })) return true;
+        return /unusual traffic|before you continue/i.test(document.body?.innerText || '')
+          || !!document.querySelector('iframe[src*="recaptcha"], #captcha-form');
       },
       { timeout: AI_OVERVIEW_WAIT_MS }
     );
-  } catch (_) { /* no AI Overview for this query — fine */ }
+  } catch (_) { /* nothing recognizable rendered — extract what exists */ }
 
-  const extracted = await page.evaluate(extractSerp, { intent: options.intent });
+  let extracted = await page.evaluate(extractSerp, { intent: options.intent });
+
+  // Overview-first extraction — the combined wait resolves on the AI
+  // Overview heading, which often renders BEFORE organic `a h3` anchors
+  // stream in. Observed: overview present + 0 organic → accept() rejected
+  // the result and the overview was discarded for Bing junk. Give organic
+  // anchors a brief second chance, then merge.
+  if (extracted.aiOverview && extracted.results.length === 0 && !extracted.blocked) {
+    try {
+      await page.waitForFunction(
+        () => !!document.querySelector('a h3'),
+        { timeout: 1500 }
+      );
+      const retry = await page.evaluate(extractSerp, { intent: options.intent });
+      if (retry.results.length > 0) {
+        extracted = { ...retry, aiOverview: retry.aiOverview || extracted.aiOverview };
+      }
+    } catch (_) { /* organic never rendered — keep the overview-only result */ }
+  }
+
+  // Consent-interstitial recovery — "Before you continue to Google" renders
+  // on google.com itself (no redirect), so the launch-time warmup click
+  // misses it when it re-appears mid-session. Click the consent control on
+  // the live page, re-navigate, re-extract — once.
+  if (extracted.blocked && extracted.blockReason === 'consent-interstitial') {
+    try {
+      const btn = page.locator(
+        'button:has-text("Accept all"), button:has-text("I agree"), button:has-text("Accept"), ' +
+        'button:has-text("Agree"), button:has-text("Alle akzeptieren"), button:has-text("Tout accepter"), ' +
+        'button:has-text("Aceptar todo"), button:has-text("接受"), button:has-text("同意"), input[type="submit"]'
+      ).first();
+      if (await btn.count()) {
+        await btn.click({ timeout: 3000 }).catch(() => {});
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+        const retry = await page.evaluate(extractSerp, { intent: options.intent });
+        if (retry.results.length > 0 || retry.aiOverview || !retry.blocked) {
+          console.log('[google-serp] consent interstitial accepted — SERP recovered');
+          extracted = retry;
+        }
+      }
+    } catch (e) {
+      console.log(`[google-serp] consent-interstitial recovery failed: ${e.message}`);
+    }
+  }
+
+  // Empty-shell recovery — the SERP variant served to this engine rendered
+  // nothing extractable. The basic-HTML SERP (gbv=1) always renders plain
+  // result anchors; re-navigate once and re-extract before giving up.
+  if (!extracted.blocked
+      && extracted.results.length <= 1 && !extracted.aiOverview
+      && (extracted.emptyShell || extracted.results.length === 0 || (extracted.rawText || '').length < 400)) {
+    try {
+      console.log(`[google-serp] thin extraction (n=${extracted.results.length}) — retrying with gbv=1 (title="${extracted.debug?.title || ''}")`);
+      await page.goto(`${url}&gbv=1`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+      const retry = await page.evaluate(extractSerp, { intent: options.intent });
+      if (retry.results.length > 0 || retry.aiOverview || retry.blocked) extracted = retry;
+    } catch (e) {
+      console.log(`[google-serp] gbv=1 retry failed: ${e.message}`);
+    }
+  }
 
   if (extracted.blocked) {
     searchBrowser.markEngineBlocked('google', GOOGLE_BLOCK_COOLDOWN_MS);
@@ -645,8 +780,8 @@ export async function searchGoogleSerp(query, options = {}) {
       if (r.type !== 'image' && (r.thumbnail || r.imageUrl)) r.type = 'image';
     }
     if (!results.some(r => r.type === 'image')) {
-      console.warn(`[google-serp] image intent but 0 images — headings: ${JSON.stringify(extracted.debug?.headings || [])}`);
-      console.warn(`[google-serp] img sizes: ${JSON.stringify(extracted.debug?.imgs || [])}`);
+      console.log(`[google-serp] image intent but 0 images — headings: ${JSON.stringify(extracted.debug?.headings || [])}`);
+      console.log(`[google-serp] img sizes: ${JSON.stringify(extracted.debug?.imgs || [])}`);
     }
     results = [...results.filter(r => r.type === 'image'), ...results.filter(r => r.type !== 'image')];
   }
@@ -665,6 +800,14 @@ export async function searchGoogleSerp(query, options = {}) {
     await Promise.all([unwrapGoogleUrls(results), enrichVideoTitles(results)]);
     return results;
   };
+
+  // Fingerprint the page on total/near-total extraction failure — the next
+  // log line tells us what Google actually served (consent text, JS-required
+  // shell, bot wall) instead of a bare "empty results". n<=1 because a lone
+  // raw-text fallback row also means the organic extraction missed.
+  if (results.length <= 1 && !extracted.blocked && !extracted.aiOverview) {
+    console.log(`[google-serp] 0 organic — title="${extracted.debug?.title || ''}" url=${(extracted.debug?.url || '').slice(0, 100)} body="${(extracted.debug?.bodyPeek || '').replace(/\s+/g, ' ').slice(0, 200)}" headings=${JSON.stringify((extracted.debug?.headings || []).slice(0, 12))}`);
+  }
 
   // Never return empty when the page had real content — wrap the raw text.
   if (results.length === 0 && (extracted.rawText || '').length > 400 && !extracted.aiOverview) {

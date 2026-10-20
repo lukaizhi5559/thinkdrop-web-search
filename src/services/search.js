@@ -2,6 +2,7 @@ import { searchNewsAPI, searchNews } from '../providers/newsapi.js';
 import { searchDuckDuckGo } from '../providers/duckduckgo.js';
 import { searchGoogleSerp } from '../providers/googleSerp.js';
 import { searchBingSerp } from '../providers/bingSerp.js';
+import { searchBingCopilot } from '../providers/bingCopilot.js';
 import { 
   searchBraveWeb, 
   searchBraveRich, 
@@ -90,6 +91,8 @@ async function searchWithFallback(query, options = {}) {
       return await searchGoogleSerp(query, options);
     } else if (options.provider === 'bing-serp' || options.provider === 'bing') {
       return await searchBingSerp(query, options);
+    } else if (options.provider === 'bing-copilot' || options.provider === 'copilot') {
+      return await searchBingCopilot(query, options);
     }
   }
 
@@ -109,9 +112,22 @@ async function searchWithFallback(query, options = {}) {
   // Media results carry alt-text titles that never echo query terms — the
   // relevance check would wrongly reject a valid image/video SERP.
   const skipRelevance = intent === 'image' || intent === 'video' || intent === 'music';
-  const accept = (r, min = 2) =>
-    r?.results?.length >= min && !isLoginWallJunk(r.results) &&
-    (skipRelevance || resultsMatchQuery(effectiveQuery, r.results));
+  const accept = (r, min = 2) => {
+    if (!r) return false;
+    const n = r.results?.length || 0;
+    // An AI Overview IS the answer — accept it even when organic extraction
+    // came back thin/empty. Observed: overview-only SERPs failed the min-2
+    // gate and fell through to Bing "calculator" spam, discarding the
+    // overview entirely.
+    if (r.aiOverview) {
+      // The overview is the answer — organic thinness/irrelevance doesn't
+      // matter (observed: n=9 + overview rejected on title relevance while
+      // the overview itself held the exact stat asked for).
+      return !isLoginWallJunk(r.results);
+    }
+    return n >= min && !isLoginWallJunk(r.results) &&
+      (skipRelevance || resultsMatchQuery(effectiveQuery, r.results));
+  };
   // Non-English queries skip English-keyword enhancement — appending English
   // words would de-localize the SERP.
   const enhancedQuery = (options.lang && options.lang !== 'en') ? query : classified.enhancedQuery;
@@ -122,76 +138,50 @@ async function searchWithFallback(query, options = {}) {
   // Update query for cache key to use enhanced version (consistent with search)
   const effectiveQuery = enhancedQuery;
 
-  // Step 2: Google SERP via hidden Chrome (AI Overview + organic + verticals)
-  try {
-    console.log('� Step 2: Google SERP via Playwright Chrome...');
-    const googleResult = await searchGoogleSerp(effectiveQuery, { ...options, intent });
-    if (accept(googleResult)) {
-      console.log(`✅ Google SERP returned ${googleResult.results.length} results (intent: ${intent})`);
-      return googleResult;
-    }
-    if (googleResult.results?.length > 0 && !isLoginWallJunk(googleResult.results) &&
-        resultsMatchQuery(effectiveQuery, googleResult.results)) {
-      weakResult = weakResult || googleResult; // 1 result — weak, keep trying
-    }
-    if (isLoginWallJunk(googleResult.results)) {
-      console.warn('⚠️  Google SERP returned a sign-in wall, trying Bing...');
-      searchBrowser.markEngineBlocked('google', 10 * 60 * 1000);
-    } else if (googleResult.blocked) {
-      console.warn(`⚠️  Google SERP blocked (${googleResult.blocked}), trying Bing...`);
-    } else if (googleResult.pacedOut) {
-      console.warn('⚠️  Google SERP paced out (human-rate guard), trying Bing...');
-    } else {
-      console.log('⚠️  Google SERP returned empty results, trying Bing...');
-    }
-  } catch (error) {
-    console.warn('⚠️  Google SERP failed:', error.message);
-    lastError = error;
-  }
+  // Intent-ordered provider chain. Google primary everywhere (~2-3s, now
+  // hardened with consent/gbv=1/thin recovery); Bing Copilot is the rich
+  // fallback for web/news — its generated answer covers the thin AI-Mode
+  // pages Google occasionally serves, at the cost of ~10-15s generation.
+  // Media intents skip Copilot entirely (no image/video results there).
+  const isMedia = intent === 'image' || intent === 'video' || intent === 'music';
+  const CHAIN = isMedia
+    ? [['google-serp', 'Google SERP', searchGoogleSerp],
+       ['bing-serp', 'Bing SERP', searchBingSerp]]
+    : [['google-serp', 'Google SERP', searchGoogleSerp],
+       ['bing-copilot', 'Bing Copilot', searchBingCopilot],
+       ['bing-serp', 'Bing SERP', searchBingSerp]];
+  CHAIN.push(['duckduckgo', 'DuckDuckGo', searchDuckDuckGo]);
+  const primaryKey = CHAIN[0][0];
 
-  // Step 3: Bing SERP via the same hidden Chrome
-  try {
-    console.log('🔍 Step 3: Bing SERP via Playwright Chrome...');
-    const bingResult = await searchBingSerp(effectiveQuery, { ...options, intent });
-    if (accept(bingResult)) {
-      console.log(`✅ Bing SERP returned ${bingResult.results.length} results`);
-      return bingResult;
+  let step = 1;
+  for (const [key, label, fn] of CHAIN) {
+    step++;
+    try {
+      console.log(`🔍 Step ${step}: ${label} via ${key === 'duckduckgo' ? 'API (free provider)' : 'Playwright Chrome'}...`);
+      const r = await fn(effectiveQuery, { ...options, intent, onChunk: options.onAnswerChunk });
+      if (accept(r)) {
+        r._chainRole = key === primaryKey ? 'primary' : 'fallback';
+        console.log(`✅ ${label} returned ${r.results.length} results${r.aiOverview ? ' + answer' : ''}`);
+        return r;
+      }
+      if (r?.results?.length > 0 && !isLoginWallJunk(r.results) &&
+          resultsMatchQuery(effectiveQuery, r.results)) {
+        weakResult = weakResult || r;
+      }
+      if (isLoginWallJunk(r?.results)) {
+        console.warn(`⚠️  ${label} returned a sign-in wall, trying next...`);
+        if (key === 'google-serp') searchBrowser.markEngineBlocked('google', 10 * 60 * 1000);
+      } else if (r?.blocked) {
+        console.warn(`⚠️  ${label} blocked (${r.blocked}), trying next...`);
+      } else if (r?.pacedOut) {
+        console.warn(`⚠️  ${label} paced out (human-rate guard), trying next...`);
+      } else {
+        console.log(`⚠️  ${label} unusable (n=${r?.results?.length || 0}, overview=${!!r?.aiOverview}), trying next...`);
+      }
+    } catch (error) {
+      console.warn(`⚠️  ${label} failed:`, error.message);
+      lastError = error;
     }
-    if (bingResult.results?.length > 0 && !isLoginWallJunk(bingResult.results) &&
-        resultsMatchQuery(effectiveQuery, bingResult.results)) {
-      weakResult = weakResult || bingResult;
-    }
-    if (bingResult.results?.length > 0 && !resultsMatchQuery(effectiveQuery, bingResult.results)) {
-      console.warn('⚠️  Bing SERP results don\'t match query (degraded SERP), trying DuckDuckGo...');
-    } else
-    if (isLoginWallJunk(bingResult.results)) {
-      console.warn('⚠️  Bing SERP returned a sign-in wall, trying DuckDuckGo...');
-    } else {
-      console.log('⚠️  Bing SERP returned empty/weak results');
-    }
-  } catch (error) {
-    console.warn('⚠️  Bing SERP failed:', error.message);
-    lastError = error;
-  }
-
-  // Step 4: Try DuckDuckGo (free, unlimited, no browser needed)
-  try {
-    console.log('🔍 Step 4: Trying DuckDuckGo (free provider)...');
-    const duckResult = await searchDuckDuckGo(effectiveQuery, options);
-
-    if (duckResult.results && duckResult.results.length > 0 && !isLoginWallJunk(duckResult.results)) {
-      console.log(`✅ DuckDuckGo returned ${duckResult.results.length} results`);
-      return duckResult;
-    }
-    if (duckResult.results?.length > 0 && !isLoginWallJunk(duckResult.results) &&
-        resultsMatchQuery(effectiveQuery, duckResult.results)) {
-      weakResult = weakResult || duckResult;
-    }
-
-    console.log('⚠️  DuckDuckGo returned empty results');
-  } catch (error) {
-    console.warn('⚠️  DuckDuckGo failed:', error.message);
-    lastError = error;
   }
 
   // Step 5: All providers failed - return LLM fallback response.
@@ -292,8 +282,15 @@ async function _executeAndCache(query, options, context, cacheKey, startTime) {
   const searchResult = await searchWithFallback(query, options);
   const elapsedMs = Date.now() - startTime;
 
-  // Cache the result
-  const ttl = getCacheTTL(query, options);
+  // Fallback-provider results (bing/duckduckgo served because the google
+  // engine failed) get the short TTL — a full 24h cache keeps serving the
+  // degraded SERP long after the primary recovers (observed: bing
+  // "percentage calculator" spam persisted across retries for the whole
+  // failure window).
+  const _autoChain = !options.provider || options.provider === 'auto';
+  const ttl = (_autoChain && searchResult._chainRole !== 'primary')
+    ? Math.min(getCacheTTL(query, options), 10 * 60 * 1000)
+    : getCacheTTL(query, options);
   await setCachedResult(cacheKey, {
     query,
     provider: searchResult.provider,

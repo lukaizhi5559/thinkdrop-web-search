@@ -73,6 +73,9 @@ function isBreadcrumbJunk(results) {
 async function searchWithFallback(query, options = {}) {
   // If specific provider requested, use it directly
   if (options.provider && options.provider !== 'auto') {
+    if (typeof options.onEvent === 'function') {
+      try { options.onEvent({ type: 'engine', engine: options.provider }); } catch (_) {}
+    }
     if (options.provider === 'brave-rich') {
       return await searchBraveRich(query, options);
     } else if (options.provider === 'brave-news') {
@@ -157,8 +160,13 @@ async function searchWithFallback(query, options = {}) {
   for (const [key, label, fn] of CHAIN) {
     step++;
     try {
+      // Progress event — consumers show "Searching <engine>" chip updates as
+      // the chain falls through (SSE stream:true only; no-op otherwise).
+      if (typeof options.onEvent === 'function') {
+        try { options.onEvent({ type: 'engine', engine: key }); } catch (_) {}
+      }
       console.log(`🔍 Step ${step}: ${label} via ${key === 'duckduckgo' ? 'API (free provider)' : 'Playwright Chrome'}...`);
-      const r = await fn(effectiveQuery, { ...options, intent, onChunk: options.onAnswerChunk });
+      const r = await fn(effectiveQuery, { ...options, intent, onChunk: options.onAnswerChunk, onPartial: options.onPartial });
       if (accept(r)) {
         r._chainRole = key === primaryKey ? 'primary' : 'fallback';
         console.log(`✅ ${label} returned ${r.results.length} results${r.aiOverview ? ' + answer' : ''}`);
@@ -203,6 +211,11 @@ async function searchWithFallback(query, options = {}) {
     results: [],
     total: 0,
     provider: 'llm-fallback',
+    // Entire free chain (Google → Bing Copilot → Bing → DDG) is down — surface
+    // actionable guidance rather than a silent empty result set. Callers that
+    // render chat answers should show userMessage verbatim.
+    searchUnavailable: true,
+    userMessage: "I couldn't reach any free web search providers right now. To search the web, connect a Web Search API (e.g. Brave Search API) in Settings.",
     fallback: {
       title: 'Search providers unavailable',
       description: `I apologize, but I'm unable to search the web right now due to provider limitations. However, I can try to help answer your question: "${effectiveQuery}" based on my training data. Please note that my knowledge may be outdated and I cannot access real-time information.`,
@@ -227,7 +240,12 @@ export async function search(query, options = {}, context = {}) {
   // An image/video-intent entry containing zero media results predates the
   // extraction that produces them — evict and re-scrape.
   const missingMedia = mediaIntent && cached && !(cached.results || []).some(r => r.type === 'image' || r.type === 'image-result' || r.type === 'video');
-  if (cached && (missingMedia || isLoginWallJunk(cached.results) || (!mediaIntent && !resultsMatchQuery(query, cached.results)) || isFaviconJunk(cached.results) || isBreadcrumbJunk(cached.results))) {
+  // Overviews scraped before the social-block floor shipped — stacked
+  // "N comments/reactions/time-ago" markers mean a discussions carousel was
+  // mis-scored as the AI Overview. Evict and re-scrape.
+  const junkOverview = cached?.aiOverview
+    && ((cached.aiOverview.match(/\b[\d.,]+k?\+?\s*(?:comments?|reactions?|likes|views|reposts)\b|\b\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/gi) || []).length >= 3);
+  if (cached && (missingMedia || junkOverview || isLoginWallJunk(cached.results) || (!mediaIntent && !resultsMatchQuery(query, cached.results)) || isFaviconJunk(cached.results) || isBreadcrumbJunk(cached.results))) {
     // Junk scraped before the guards existed (sign-in wall, or a degraded
     // query-agnostic SERP) — evict and fall through to a live search.
     console.warn(`🗑️  Evicting junk cache entry for "${query}"`);

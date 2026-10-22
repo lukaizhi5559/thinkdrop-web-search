@@ -56,6 +56,50 @@ async function enrichVideoTitles(results) {
  * In-page extractor for the main SERP. Single evaluate, layered so partial
  * markup breakage degrades to rawText rather than empty results.
  */
+
+// Lite pass — organic anchors + their source hosts only. Runs right after
+// the render wait resolves so stream:true consumers can show favicon chips
+// while the full extractSerp/media phases are still working.
+function extractOrganicLite() {
+  const isGoogleUrl = (u) => { try { return new URL(u).hostname.endsWith('google.com'); } catch (_) { return true; } };
+  const items = [], seen = new Set();
+  for (const h3 of document.querySelectorAll('a h3')) {
+    const a = h3.closest('a[href]');
+    let href = a?.href || '';
+    // Organic hrefs are often google.com/url?q= wrapped — unwrap before the
+    // isGoogleUrl check, same as extractSerp's section-4a.
+    try {
+      const u = new URL(href, location.origin);
+      if (u.pathname === '/url' && u.searchParams.get('q')) href = u.searchParams.get('q');
+      if (u.pathname === '/url' && u.searchParams.get('url')) href = u.searchParams.get('url');
+    } catch (_) {}
+    if (!href || seen.has(href) || isGoogleUrl(href)) continue;
+    seen.add(href);
+    // Cite row carries the real host even when the href stayed wrapped.
+    let displayDomain = '';
+    const cite = a.querySelector('cite');
+    const citeM = ((cite && cite.innerText) || a.innerText || '')
+      .match(/(?:https?:\/\/)?([\w.-]+\.(?:com|net|org|io|ai|app|co|dev|gov|edu|info|me|us|uk|de|fr|jp|au|ca|tv|gg|news|shop|store|site))\b/i);
+    if (citeM) displayDomain = citeM[1].replace(/^www\./, '').toLowerCase();
+    items.push({
+      title: (h3.textContent || '').trim().slice(0, 140),
+      url: href,
+      ...(displayDomain && { displayDomain }),
+      type: 'web-result'
+    });
+    if (items.length >= 8) break;
+  }
+  const sh = new Set(), sources = [];
+  for (const it of items) {
+    let hostname = it.displayDomain || '';
+    if (!hostname) { try { hostname = new URL(it.url).hostname.replace(/^www\./, ''); } catch (_) {} }
+    if (!hostname || sh.has(hostname)) continue;
+    sh.add(hostname);
+    sources.push({ url: it.url, hostname, title: it.title });
+  }
+  return { items, sources };
+}
+
 function extractSerp(opts = {}) {
   const out = { blocked: false, blockReason: null, aiOverview: null, results: [], rawText: '' };
   const txt = (el) => (el?.innerText || el?.textContent || '').trim();
@@ -162,10 +206,14 @@ function extractSerp(opts = {}) {
     .filter(a => !isGoogleUrl(a.href)).length;
   if (bodyText.length < 200 && _externalAnchors === 0) out.emptyShell = true;
 
-  // ── 2. AI Overview ────────────────────────────────────────────────────
-  // Locate the "AI Overview" heading (localized label set covers the languages
-  // comms-graph can hand us via original-language queries), climb to the
-  // smallest ancestor with substantial text, then strip script/UI junk.
+  // ── 2. Answer block (AI Overview / AI Mode / future answer surfaces) ──
+  // Signal-based, not label-anchored: Google's generated answer is the
+  // substantial prose region BEFORE the first organic result in the main
+  // column. Localized labels are a scoring bonus only — a renamed panel is
+  // still found because it sits in the same slot. UI chrome (share sheets,
+  // feedback rows, tab bars, sr-only live text like "AI Mode replied") is
+  // pruned by BEHAVIOR (role/aria/hidden/size), not wording, so added or
+  // renamed controls can't leak into the answer.
   const AI_OVERVIEW_LABELS = new Set([
     'ai overview', 'ai mode',
     'ai 概览', 'ai概览',                    // zh
@@ -177,17 +225,39 @@ function extractSerp(opts = {}) {
     'visão geral de ia',                    // pt
     'обзор от ии',                          // ru
   ]);
+  const CHROME_ROLES = new Set(['button', 'menu', 'menubar', 'menuitem',
+    'tooltip', 'status', 'alert', 'dialog', 'navigation', 'complementary',
+    'tab', 'tablist', 'banner', 'contentinfo', 'search', 'form']);
+  const isChromeEl = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
+    const role = el.getAttribute('role');
+    if (role && CHROME_ROLES.has(role)) return true;
+    if (el.hasAttribute('aria-live')) return true;
+    // display:none elements and 1px-clipped sr-only announcements — Google's
+    // a11y text ("AI Mode replied") lives here and innerText keeps it.
+    if ((el.offsetWidth || 0) <= 1 && (el.offsetHeight || 0) <= 1) return true;
+    return false;
+  };
+  // Backstop line filter — role/hidden pruning (A3) removes chrome by
+  // behavior; these exact-line drops catch strays that survive (e.g. chrome
+  // rendered as plain divs). Exact-match only, so real prose can't hit it.
+  const CHROME_LINE_RE = /^(?:share public link|copy link|copied to clipboard|can'?t copy[^\n]*|learn more|good response|bad response|show all|show less|show more|read more|load more|view more|see more|dive deeper[^\n]*|listen|feedback|report|help|sign in|all|ai mode|ai overview|ai mode replied[^\n]*|images|videos|short videos|news|maps|shopping|forums|flights|finance|more|tools|web|share|facebook|gmail|x|reddit|whatsapp|export to \w+|people also ask|related searches|next|previous|close|about this result)\.?$/i;
   const cleanAiText = (t) => t
     .replace(/^#{0,6}\s*AI (Overview|Mode)[^\n]*\n?/i, '')
     .replace(/^#{0,6}\s*AI (Overview|Mode)\s*$/im, '')
     // "+N" citation chips concatenated into prose by innerText (the DOM→md
     // path already converts them to [n] markers — this catches the fallback).
     .replace(/ ?\+\d{1,2}(?=\s|$)/gm, '')
+    // Truncation toggles concatenate inline at the end of innerText
+    // ("...the constitution ...Read more") — strip anywhere they occur.
+    .replace(/ ?(?:\.\.\.|…)? ?(?:read more|show more|view more|load more|see more)\.?(?=\s|$)/gi, '')
     .split('\n')
     .map(l => l.trim())
     .filter(l => !AI_OVERVIEW_LABELS.has(l.replace(/^#{1,6}\s*/, '').toLowerCase()))
     .filter(l => l && !/[{;}]|function\s*\(|window\.|try\s*\{|\.rll\(|var |const |=>/.test(l)
-             && !/^(show more|show less|all|images|videos|news|more|tools)$/i.test(l))
+             && !CHROME_LINE_RE.test(l.replace(/^#{1,6}\s*/, ''))
+             && !/^ai mode replied?$/i.test(l))
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .slice(0, 3000)
@@ -201,24 +271,31 @@ function extractSerp(opts = {}) {
   const BLOCK_MD = new Set(['P','DIV','SECTION','ARTICLE','MAIN','HEADER','FOOTER','UL','OL','LI','TABLE','THEAD','TBODY','TR','H1','H2','H3','H4','H5','H6','BLOCKQUOTE','PRE','HR','DL','DT','DD','FIGURE','DETAILS','SUMMARY']);
   const mdInline = (node) => {
     let s = '';
+    // Element boundaries carry no whitespace in the DOM ("Sydney<span>because"
+    // comes from innerText inserts a space where DOM concatenation doesn't) —
+    // insert a boundary space unless the piece starts with punctuation/space.
+    const app = (piece) => {
+      if (piece && s && !/\s$/.test(s) && !/^[\s,.;:!?%)\]]/.test(piece)) s += ' ';
+      s += piece;
+    };
     for (const c of node.childNodes || []) {
-      if (c.nodeType === 3) { s += c.nodeValue; continue; }
-      if (c.nodeType !== 1 || SKIP_MD.has(c.tagName)) continue;
+      if (c.nodeType === 3) { app(c.nodeValue); continue; }
+      if (c.nodeType !== 1 || SKIP_MD.has(c.tagName) || isChromeEl(c)) continue;
       const t = (c.textContent || '').trim();
       if (!t) continue;
-      if (/^\+\d{1,2}$/.test(t)) { s += ` [${t.slice(1)}]`; continue; }
-      if (c.tagName === 'SUP' && /^\[?\d{1,2}\]?$/.test(t)) { s += ` [${t.replace(/\D/g, '')}]`; continue; }
+      if (/^\+\d{1,2}$/.test(t)) { app(`[${t.slice(1)}]`); continue; }
+      if (c.tagName === 'SUP' && /^\[?\d{1,2}\]?$/.test(t)) { app(`[${t.replace(/\D/g, '')}]`); continue; }
       if (c.tagName === 'BR') { s += '  \n'; continue; }
       if (c.tagName === 'A') {
         const href = c.href || '';
         const label = mdInline(c).trim() || t;
-        s += (href && /^https?:/.test(href) && !isGoogleUrl(href)) ? ` [${label}](${href})` : ` ${label}`;
+        app((href && /^https?:/.test(href) && !isGoogleUrl(href)) ? `[${label}](${href})` : label);
         continue;
       }
-      if (c.tagName === 'STRONG' || c.tagName === 'B') { s += ` **${mdInline(c).trim() || t}**`; continue; }
-      if (c.tagName === 'EM' || c.tagName === 'I') { s += ` *${mdInline(c).trim() || t}*`; continue; }
-      if (c.tagName === 'CODE') { s += ` \`${t}\``; continue; }
-      s += mdInline(c);
+      if (c.tagName === 'STRONG' || c.tagName === 'B') { app(`**${mdInline(c).trim() || t}**`); continue; }
+      if (c.tagName === 'EM' || c.tagName === 'I') { app(`*${mdInline(c).trim() || t}*`); continue; }
+      if (c.tagName === 'CODE') { app(`\`${t}\``); continue; }
+      app(mdInline(c));
     }
     return s;
   };
@@ -227,7 +304,7 @@ function extractSerp(opts = {}) {
     let nested = '';
     for (const c of li.childNodes || []) {
       if (c.nodeType === 3) parts.push(c.nodeValue);
-      else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName)) {
+      else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName) && !isChromeEl(c)) {
         if (c.tagName === 'UL' || c.tagName === 'OL') {
           const items = [...c.children].filter(x => x.tagName === 'LI');
           nested += '\n' + items.map((x, i) => `  ${c.tagName === 'OL' ? `${i + 1}.` : '-'} ${mdItem(x)}`).join('\n');
@@ -249,13 +326,13 @@ function extractSerp(opts = {}) {
     const direct = [];
     for (const c of el.childNodes || []) {
       if (c.nodeType === 3) direct.push(c.nodeValue);
-      else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName) && !BLOCK_MD.has(c.tagName)) direct.push(mdInline(c));
+      else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName) && !BLOCK_MD.has(c.tagName) && !isChromeEl(c)) direct.push(mdInline(c));
     }
     const lead = direct.join('').replace(/\s+/g, ' ').trim();
     if (lead) out += lead + '\n\n';
     for (const c of el.children || []) {
       const tag = c.tagName;
-      if (SKIP_MD.has(tag) || !(c.textContent || '').trim()) continue;
+      if (SKIP_MD.has(tag) || isChromeEl(c) || !(c.textContent || '').trim()) continue;
       if (/^H[1-6]$/.test(tag)) { const t = mdInline(c).trim(); if (t) out += `${'#'.repeat(+tag[1])} ${t}\n\n`; continue; }
       if (tag === 'UL' || tag === 'OL') {
         const items = [...c.children].filter(li => li.tagName === 'LI');
@@ -272,18 +349,103 @@ function extractSerp(opts = {}) {
     }
     return out;
   };
-  for (const h of document.querySelectorAll('h1, h2, h3, div[role="heading"], strong')) {
-    const hl = txt(h).trim().toLowerCase();
-    if (AI_OVERVIEW_LABELS.has(hl)) {
-      let node = h.parentElement;
-      for (let i = 0; i < 6 && node; i++) {
-        const md = mdBlocks(node).trim();
-        const t = cleanAiText(md.length > 40 ? md : (node.innerText || ''));
-        if (t.length > 80) { out.aiOverview = t; break; }
-        node = node.parentElement;
-      }
-      if (out.aiOverview) break;
+  // Candidate pool = every substantial block that renders BEFORE the first
+  // organic result in the main column, in READING ORDER — ancestors of the
+  // first organic are wrappers (skipped), and siblings AFTER it are
+  // Discussions-and-forums carousels / People-also-ask / related searches —
+  // not answers. The position gate is what keeps those out of the pool.
+  const _mainCol = document.querySelector('#rcnt, #search, #center_col, main, [role="main"]') || document.body;
+  const _firstOrganic = _mainCol.querySelector('a h3');
+  const _FOLLOWING = 4; // Node.DOCUMENT_POSITION_FOLLOWING
+  const _candSet = new Set();
+  for (const el of _mainCol.querySelectorAll('div, section, article')) {
+    const t = (el.innerText || '').trim();
+    if (t.length < 80 || t.length > 20000) continue;
+    if (_firstOrganic) {
+      if (el.contains(_firstOrganic)) continue;
+      if (!(el.compareDocumentPosition(_firstOrganic) & _FOLLOWING)) continue;
     }
+    _candSet.add(el);
+  }
+  // Label-anchored climbs stay in the pool — covers layouts where the answer
+  // sits at/below the organic block or outside the main column.
+  for (const h of document.querySelectorAll('h1, h2, h3, div[role="heading"], strong')) {
+    if (AI_OVERVIEW_LABELS.has(txt(h).trim().toLowerCase())) {
+      let node = h.parentElement;
+      for (let i = 0; i < 6 && node; i++) { _candSet.add(node); node = node.parentElement; }
+    }
+  }
+  // Score each candidate: prose density + citation chips + known-label bonus
+  // vs. interactive-descendant density + chrome-line hits. The winner is the
+  // answer body, not the whole panel wrapper (which scores worse — more
+  // buttons/menus per char of prose).
+  const scoreCandidate = (el) => {
+    const t = (el.innerText || '').trim();
+    const desc = el.querySelectorAll('*').length || 1;
+    const density = t.length / desc;
+    const interactive = el.querySelectorAll(
+      'button, [role="button"], [role="menu"], [role="dialog"], [role="tab"], [role="tablist"], [aria-live], select, input, textarea'
+    ).length;
+    const chips = (t.match(/\+\d{1,2}(?=\s|$)/g) || []).length + el.querySelectorAll('sup').length;
+    let labelBonus = 0;
+    for (const h of el.querySelectorAll('h1,h2,h3,div[role="heading"],strong')) {
+      if (AI_OVERVIEW_LABELS.has(txt(h).trim().toLowerCase())) { labelBonus = 400; break; }
+    }
+    const lines = t.split('\n').map(l => l.trim()).filter(Boolean);
+    const chromeHits = lines.filter(l => CHROME_LINE_RE.test(l)).length;
+    // Link-farm penalty — organic containers and discussion carousels are
+    // ~90% anchor text; a real answer block is prose-dominated (its source
+    // links stay a small share of the characters).
+    const linkChars = [...el.querySelectorAll('a')].reduce((n, a) => n + ((a.innerText || '').trim().length), 0);
+    const linkRatio = linkChars / Math.max(t.length, 1);
+    // Social-post fingerprint — "10+ comments", "90+ reactions", "1.2K likes",
+    // plus the time-ago stamps ("1 month ago", "Aug 19, 2026") every card in a
+    // discussions/forums carousel carries. Stacked markers = social block, not
+    // an answer — the floor below hard-rejects them when no label saved them.
+    const socialHits = (t.match(/\b[\d.,]+k?\+?\s*(?:comments?|reactions?|likes|views|reposts|followers|members|posts)\b/gi) || []).length
+      + (t.match(/\b\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago\b/gi) || []).length
+      + (t.match(/\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/gi) || []).length;
+    const s = Math.min(t.length, 2500) + chips * 40 + labelBonus + Math.min(density, 40) * 10
+      - interactive * 40 - chromeHits * 60 - Math.round(linkRatio * 200) - socialHits * 40;
+    return { s, linkRatio, chips, labelBonus, socialHits };
+  };
+  const chromeRatio = (t) => {
+    const lines = t.split('\n').map(l => l.trim()).filter(Boolean);
+    return lines.length ? lines.filter(l => CHROME_LINE_RE.test(l)).length / lines.length : 1;
+  };
+  const _ranked = [..._candSet]
+    .map(el => ({ el, ...scoreCandidate(el) }))
+    .filter(c => c.s > 0)
+    // Quality floor — a link-farm with no citation chips and no label isn't
+    // an answer block, however much text it holds (image-intent SERPs often
+    // ship no AI Overview at all; none beats a discussion carousel).
+    .filter(c => !(c.linkRatio > 0.5 && c.chips === 0 && !c.labelBonus))
+    // Stacked social markers = a discussions/forums carousel, not an answer —
+    // hard floor regardless of raw text mass (label-anchored panels exempt).
+    .filter(c => !(c.socialHits >= 3 && !c.labelBonus))
+    .sort((a, b) => b.s - a.s)
+    .slice(0, 6);
+  let _bestRejected = null;
+  for (const { el: cand } of _ranked) {
+    const md = mdBlocks(cand).trim();
+    const t = cleanAiText(md.length > 40 ? md : (cand.innerText || ''));
+    if (t.length <= 80) continue;
+    // Sanity check — a candidate that's still >15% UI lines after pruning is
+    // chrome, not answer; try the next-best candidate instead of shipping it.
+    if (chromeRatio(t) <= 0.15) { out.aiOverview = t; break; }
+    if (!_bestRejected) _bestRejected = t;
+  }
+  // Everything scored as chrome — keep the least-bad pick rather than nothing,
+  // but only when it's mostly prose (a share sheet is not an answer).
+  if (!out.aiOverview && _bestRejected && chromeRatio(_bestRejected) <= 0.4) {
+    out.aiOverview = _bestRejected;
+  }
+  // Failure fingerprint — when extraction came up empty but candidates existed,
+  // their tag/role signature explains what Google served.
+  if (!out.aiOverview && _candSet.size) {
+    out.debug = out.debug || {};
+    out.debug.overviewCandidates = _ranked.map(({ el, s }) =>
+      `${s.toFixed(0)} <${el.tagName.toLowerCase()}${el.getAttribute('role') ? ` role=${el.getAttribute('role')}` : ''}> ${(el.innerText || '').replace(/\s+/g, ' ').slice(0, 60)}`);
   }
 
   // ── 3. Vertical sections (Images grid / Videos cards / Top stories) ────
@@ -557,8 +719,10 @@ function extractImageGrid() {
       const a = img.closest('a');
       if (a && a.href && !a.href.includes('google.com/search')) pageUrl = a.href;
     } catch (_) {}
+    let host = '';
+    try { host = pageUrl ? new URL(pageUrl).hostname.replace(/^www\./, '') : ''; } catch (_) {}
     out.push({
-      title: (img.alt || t.split('\n')[0] || 'Image').slice(0, 140),
+      title: (img.alt || t.split('\n')[0] || host || 'Image').slice(0, 140),
       url: pageUrl || src,
       imageUrl: src,
       thumbnail: src,
@@ -700,6 +864,16 @@ export async function searchGoogleSerp(query, options = {}) {
     );
   } catch (_) { /* nothing recognizable rendered — extract what exists */ }
 
+  // Early partial emit — organic anchors render first, so a lite pass here
+  // lets consumers show favicon chips + first cards while the full extract
+  // (media grids, overview markdown) is still running.
+  if (typeof options.onPartial === 'function') {
+    try {
+      const lite = await page.evaluate(extractOrganicLite);
+      if (lite.items.length) options.onPartial({ items: lite.items, sources: lite.sources, provider: 'google-serp' });
+    } catch (_) {}
+  }
+
   let extracted = await page.evaluate(extractSerp, { intent: options.intent });
 
   // Overview-first extraction — the combined wait resolves on the AI
@@ -768,9 +942,49 @@ export async function searchGoogleSerp(query, options = {}) {
 
   let results = extracted.results;
 
-  // Inline-only: the All tab's Images block is faster and better-looking than
-  // a dedicated tbm=isch hop (user direction — no second navigation).
+  // Post-extract partial — organic anchors often stream in after the
+  // lite pass ran (wait resolves on the overview heading first). Emit
+  // the extracted set now so consumers show cards/sources while the
+  // isch recovery hop + URL unwrap are still working.
+  if (typeof options.onPartial === 'function' && results.length) {
+    try {
+      const sh = new Set(), srcs = [];
+      for (const r of results) {
+        const host = r.displayDomain || (() => { try { return new URL(r.url || r.link || '').hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+        if (!host || host === 'google.com' || sh.has(host)) continue;
+        sh.add(host);
+        srcs.push({ url: r.url || r.link, hostname: host, title: r.title || '' });
+      }
+      options.onPartial({ items: results, sources: srcs, provider: 'google-serp' });
+    } catch (_) {}
+  }
+
+  // Inline-first: the All tab's Images block is faster and better-looking than
+  // a dedicated tbm=isch hop — but AI-Mode SERPs often ship no strip at all.
+  // One recovery navigation only when inline extraction came up short.
   const intent = options.intent;
+  if (intent === 'image'
+      && results.filter(r => r.type === 'image').length < 3
+      && !searchBrowser.paceExceeded('google')) {
+    try {
+      console.log(`[google-serp] image recovery — ${results.filter(r => r.type === 'image').length} inline images, trying tbm=isch`);
+      // Second navigation costs ~1-2s — push what we have so cards show during it.
+      if (typeof options.onPartial === 'function' && results.length) {
+        try { options.onPartial({ items: results, provider: 'google-serp' }); } catch (_) {}
+      }
+      await page.goto(`${url}&tbm=isch`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+      await page.waitForFunction(() => document.querySelectorAll('img').length > 10, { timeout: 2500 }).catch(() => {});
+      const grid = await page.evaluate(extractImageGrid);
+      const have = new Set(results.map(r => r.imageUrl || r.thumbnail || r.url));
+      const fresh = grid.filter(g => !have.has(g.imageUrl || g.thumbnail || g.url));
+      if (fresh.length) {
+        console.log(`[google-serp] tbm=isch recovery: +${fresh.length} images`);
+        results = [...fresh, ...results];
+      }
+    } catch (e) {
+      console.log(`[google-serp] tbm=isch recovery failed: ${e.message}`);
+    }
+  }
 
   // Image intent: the All-tab Images strip extracts as photo-thumbed
   // web-results (anchors with h3) — retype thumbed items as 'image' so the

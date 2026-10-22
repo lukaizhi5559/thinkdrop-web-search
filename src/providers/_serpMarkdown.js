@@ -19,6 +19,20 @@ export function serpMarkdown(root, internalRe = null) {
   if (!root || !root.querySelectorAll) return '';
   const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'CANVAS', 'IFRAME', 'BUTTON', 'SELECT', 'INPUT', 'TEXTAREA', 'FORM', 'AUDIO', 'VIDEO', 'TEMPLATE', 'NAV']);
   const BLOCK = new Set(['P', 'DIV', 'SECTION', 'ARTICLE', 'MAIN', 'HEADER', 'FOOTER', 'UL', 'OL', 'LI', 'TABLE', 'THEAD', 'TBODY', 'TR', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'PRE', 'HR', 'DL', 'DT', 'DD', 'FIGURE', 'DETAILS', 'SUMMARY']);
+  // UI chrome by behavior, not wording — share sheets, feedback rows, tab
+  // bars, and sr-only a11y text are pruned whatever labels engines give them.
+  const CHROME_ROLES = new Set(['button', 'menu', 'menubar', 'menuitem',
+    'tooltip', 'status', 'alert', 'dialog', 'navigation', 'complementary',
+    'tab', 'tablist', 'banner', 'contentinfo', 'search', 'form']);
+  const isChrome = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
+    const role = el.getAttribute('role');
+    if (role && CHROME_ROLES.has(role)) return true;
+    if (el.hasAttribute('aria-live')) return true;
+    if ((el.offsetWidth || 0) <= 1 && (el.offsetHeight || 0) <= 1) return true;
+    return false;
+  };
   const internal = internalRe ? new RegExp(internalRe, 'i') : null;
   const isInternal = (u) => {
     if (!u || !/^https?:/i.test(u)) return true;
@@ -29,7 +43,7 @@ export function serpMarkdown(root, internalRe = null) {
     let s = '';
     for (const c of node.childNodes || []) {
       if (c.nodeType === 3) { s += c.nodeValue; continue; }
-      if (c.nodeType !== 1 || SKIP.has(c.tagName)) continue;
+      if (c.nodeType !== 1 || SKIP.has(c.tagName) || isChrome(c)) continue;
       const t = (c.textContent || '').trim();
       if (!t) continue;
       if (/^\+\d{1,2}$/.test(t)) { s += ` [${t.slice(1)}]`; continue; }
@@ -53,7 +67,7 @@ export function serpMarkdown(root, internalRe = null) {
     let nested = '';
     for (const c of li.childNodes || []) {
       if (c.nodeType === 3) parts.push(c.nodeValue);
-      else if (c.nodeType === 1 && !SKIP.has(c.tagName)) {
+      else if (c.nodeType === 1 && !SKIP.has(c.tagName) && !isChrome(c)) {
         if (c.tagName === 'UL' || c.tagName === 'OL') {
           const items = [...c.children].filter(x => x.tagName === 'LI');
           nested += '\n' + items.map((x, i) => `  ${c.tagName === 'OL' ? `${i + 1}.` : '-'} ${mdItem(x)}`).join('\n');
@@ -75,13 +89,13 @@ export function serpMarkdown(root, internalRe = null) {
     const direct = [];
     for (const c of el.childNodes || []) {
       if (c.nodeType === 3) direct.push(c.nodeValue);
-      else if (c.nodeType === 1 && !SKIP.has(c.tagName) && !BLOCK.has(c.tagName)) direct.push(mdInline(c));
+      else if (c.nodeType === 1 && !SKIP.has(c.tagName) && !BLOCK.has(c.tagName) && !isChrome(c)) direct.push(mdInline(c));
     }
     const lead = direct.join('').replace(/\s+/g, ' ').trim();
     if (lead) out += lead + '\n\n';
     for (const c of el.children || []) {
       const tag = c.tagName;
-      if (SKIP.has(tag) || !(c.textContent || '').trim()) continue;
+      if (SKIP.has(tag) || isChrome(c) || !(c.textContent || '').trim()) continue;
       if (/^H[1-6]$/.test(tag)) { const t = mdInline(c).trim(); if (t) out += `${'#'.repeat(+tag[1])} ${t}\n\n`; continue; }
       if (tag === 'UL' || tag === 'OL') {
         const items = [...c.children].filter(li => li.tagName === 'LI');

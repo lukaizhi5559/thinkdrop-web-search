@@ -69,6 +69,11 @@ router.post('/web.search', async (req, res) => {
           fromDate: payload.fromDate,
           toDate: payload.toDate,
           onAnswerChunk: (t) => emit({ type: 'answer', text: t }),
+          // Progressive events — engine transitions as the provider chain
+          // falls through, and partial items as extraction phases land. The
+          // renderer shows "Searching Bing…" + favicon chips mid-fetch.
+          onEvent: (evt) => emit(evt),
+          onPartial: (partial) => emit({ type: 'items', ...partial }),
         }, {
           userId: context?.userId,
           sessionId: context?.sessionId

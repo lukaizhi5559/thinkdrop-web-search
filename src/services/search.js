@@ -250,7 +250,9 @@ export async function search(query, options = {}, context = {}) {
       || (cached.aiOverview.length < 200 && (() => {
         const _ls = cached.aiOverview.split('\n').map(l => l.trim()).filter(Boolean);
         return /\|\s*\S/.test(cached.aiOverview)
-          || (_ls.length >= 2 && _ls[0].includes(_ls[_ls.length - 1]));
+          || (_ls.length >= 2 && _ls[0].includes(_ls[_ls.length - 1]))
+          // single-line product-card titles ("X / Standee - Style")
+          || (_ls.length === 1 && /[/–—]|\s-\s/.test(_ls[0]) && !/[.!?]$/.test(_ls[0]));
       })()));
   if (cached && (missingMedia || junkOverview || isLoginWallJunk(cached.results) || (!mediaIntent && !resultsMatchQuery(query, cached.results)) || isFaviconJunk(cached.results) || isBreadcrumbJunk(cached.results))) {
     // Junk scraped before the guards existed (sign-in wall, or a degraded

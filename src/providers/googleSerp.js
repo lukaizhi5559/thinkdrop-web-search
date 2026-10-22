@@ -70,7 +70,9 @@ function extractOrganicLite() {
     // isGoogleUrl check, same as extractSerp's section-4a.
     try {
       const u = new URL(href, location.origin);
-      if (u.pathname === '/url' && u.searchParams.get('q')) href = u.searchParams.get('q');
+      // /url carries the destination under q (organic) or url (Videos tab).
+      if (u.pathname === '/url' && (u.searchParams.get('q') || u.searchParams.get('url')))
+        href = u.searchParams.get('q') || u.searchParams.get('url');
       if (u.pathname === '/url' && u.searchParams.get('url')) href = u.searchParams.get('url');
     } catch (_) {}
     if (!href || seen.has(href) || isGoogleUrl(href)) continue;
@@ -265,11 +267,32 @@ function extractSerp(opts = {}) {
       // bullets and paragraphs never pack image children like that.
       const cardish = [...el.children].filter(k => k.querySelector && k.querySelector('img'));
       if (cardish.length >= 3 && !el.hasAttribute('data-td-overview')) return true;
-      const imgAnchors = [...el.querySelectorAll('a')].filter(a => a.querySelector('img'));
-      if (imgAnchors.length >= 2) {
-        const linkChars = imgAnchors.reduce((n, a) =>
+      // A lone card-anchor — an <a> carrying a thumb with multi-line card
+      // text (title + site + age/duration, e.g. the panel-foot video card).
+      // querySelectorAll('a') can't see el itself, so this needs its own rule.
+      if (el.tagName === 'A' && el.querySelector('img')) {
+        const lt = (el.innerText || '').trim();
+        if (lt.split('\n').filter(Boolean).length >= 2
+            || /\b\d{1,2}:\d{2}\b|\b\d+[smhdwy]\b|\bago\b/i.test(lt)) return true;
+      }
+      // Source-list chrome can be text-only rows (Quora/Reddit/Wikipedia
+      // citations under the answer) — no imgs at all. An element whose text
+      // is dominated by ≥3 link labels is a citation strip, not prose.
+      const anchors = [...el.querySelectorAll('a')]
+        .filter(a => ((a.innerText || a.textContent) || '').trim().length > 3);
+      const imgAnchors = anchors.filter(a => a.querySelector('img'));
+      if (imgAnchors.length >= 2 || anchors.length >= 3) {
+        const heavy = imgAnchors.length >= 2 ? imgAnchors : anchors;
+        const linkChars = heavy.reduce((n, a) =>
           n + ((a.innerText || a.textContent || '').trim().length), 0);
         if (linkChars / Math.max((el.textContent || '').trim().length, 1) > 0.5) return true;
+      }
+      // A wrapper holding ONE multi-line card-anchor (title + site + age) is
+      // still a card — the ≥3 rule above can't see it.
+      if (imgAnchors.length >= 1 && imgAnchors.length <= 2
+          && imgAnchors.some(a => (a.innerText || '').split('\n').filter(Boolean).length >= 2)) {
+        const cardChars = imgAnchors.reduce((n, a) => n + (a.innerText || '').trim().length, 0);
+        if (cardChars / Math.max((el.textContent || '').trim().length, 1) > 0.5) return true;
       }
     }
     return false;
@@ -298,7 +321,7 @@ function extractSerp(opts = {}) {
              && !/^ai mode replied?$/i.test(l))
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
-    .slice(0, 3000)
+    .slice(0, 4000)
     .trim();
   // Translate the overview's native DOM into markdown — headings, lists,
   // tables, bold, and real links survive; innerText flattens all of it and
@@ -482,6 +505,9 @@ function extractSerp(opts = {}) {
     const ls = t.split('\n').map(l => l.trim()).filter(Boolean);
     if (/\|\s*\S/.test(t)) return true;
     if (ls.length >= 2 && ls[0].includes(ls[ls.length - 1])) return true;
+    // Single-line product/result-card titles — slash- or dash-separated
+    // fragments ("X / Standee - Dark Knight Style"), no sentence punctuation.
+    if (ls.length === 1 && /[/–—]|\s-\s/.test(ls[0]) && !/[.!?]$/.test(ls[0])) return true;
     return false;
   };
   let _bestRejected = null;
@@ -492,8 +518,15 @@ function extractSerp(opts = {}) {
     // outermost-first, and the outermost marked node IS the panel root.
     const target = cand.hasAttribute('data-td-overview') ? cand
       : (cand.querySelector('[data-td-overview]') || cand);
-    const md = mdBlocks(target).trim();
-    const t = cleanAiText(md.length > 40 ? md : (target.innerText || ''));
+    let md = mdBlocks(target).trim();
+    let t = cleanAiText(md.length > 40 ? md : (target.innerText || ''));
+    // AI-Mode variants mark a reply box that's pure UI chrome (share/copy/
+    // feedback) while the real answer prose sits elsewhere in the winner —
+    // when the panel extracts to nothing, retry on the candidate itself.
+    if (t.length <= 80 && target !== cand) {
+      md = mdBlocks(cand).trim();
+      t = cleanAiText(md.length > 40 ? md : (cand.innerText || ''));
+    }
     if (t.length <= 80 || isCaptionShape(t)) continue;
     // Sanity check — a candidate that's still >15% UI lines after pruning is
     // chrome, not answer; try the next-best candidate instead of shipping it.
@@ -504,6 +537,26 @@ function extractSerp(opts = {}) {
   // but only when it's mostly prose (a share sheet is not an answer).
   if (!out.aiOverview && _bestRejected && chromeRatio(_bestRejected) <= 0.4) {
     out.aiOverview = _bestRejected;
+  }
+  // AI-Mode variants: the label sits in a chrome-only reply box (share/copy/
+  // feedback) while the answer prose is a SIBLING block of some ancestor.
+  // Walk each ancestor's forward siblings until a clean text block appears.
+  if (!out.aiOverview) {
+    for (const h of document.querySelectorAll('h1, h2, h3, div[role="heading"], strong')) {
+      if (!AI_OVERVIEW_LABELS.has(txt(h).trim().toLowerCase())) continue;
+      let node = h.parentElement;
+      for (let i = 0; i < 6 && node && node !== document.body && !out.aiOverview; i++) {
+        let sib = node.nextElementSibling;
+        for (let j = 0; j < 3 && sib; j++) {
+          const md = mdBlocks(sib).trim();
+          const t = cleanAiText(md.length > 40 ? md : (sib.innerText || ''));
+          if (t.length > 80 && !isCaptionShape(t) && chromeRatio(t) <= 0.15) { out.aiOverview = t; break; }
+          sib = sib.nextElementSibling;
+        }
+        node = node.parentElement;
+      }
+      if (out.aiOverview) break;
+    }
   }
   // Failure fingerprint — when extraction came up empty but candidates existed,
   // their tag/role signature explains what Google served.
@@ -837,7 +890,9 @@ function extractVideoList() {
     let href = a.href;
     try {
       const u = new URL(href, location.origin);
-      if (u.pathname === '/url' && u.searchParams.get('q')) href = u.searchParams.get('q');
+      // /url carries the destination under q (organic) or url (Videos tab).
+      if (u.pathname === '/url' && (u.searchParams.get('q') || u.searchParams.get('url')))
+        href = u.searchParams.get('q') || u.searchParams.get('url');
     } catch (_) {}
     // /goto wrapped links pass through — unwrapGoogleUrls resolves them
     // server-side; only other google-internal links are junk.
@@ -1138,6 +1193,7 @@ export async function searchGoogleSerp(query, options = {}) {
       await page.goto(`${url}&tbm=vid`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
       await page.waitForFunction(() => document.querySelectorAll('a[href] img').length > 4, { timeout: 2500 }).catch(() => {});
       const vids = await page.evaluate(extractVideoList);
+      console.log(`[google-serp] tbm=vid page: ${vids.length} rows (title="${await page.title().catch(() => '')}")`);
       const have = new Set(results.map(r => r.url));
       const fresh = vids.filter(v => !have.has(v.url)).slice(0, 6);
       if (fresh.length) {

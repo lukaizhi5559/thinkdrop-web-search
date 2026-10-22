@@ -60,6 +60,21 @@ See `.env.example` for all available configuration options.
 - `RATE_LIMIT_ENABLED` - Enable/disable rate limiting (default: true)
 - `NEWSAPI_KEY` - Optional NewsAPI key if you want news-specific features
 
+## Provider Notes
+
+- **Licensed APIs vs. page scraping**: the Brave and Bing API providers are
+  the properly licensed path — configure the keys above and they take
+  precedence. The free fallback chain (Google SERP → Bing SERP → DuckDuckGo)
+  scrapes public result pages on demand; it is best-effort, unofficial, and
+  may break when engines change their markup or rate-limit automated traffic.
+- **Dedicated browser profile**: SERP scraping runs in a separate anonymous
+  profile (`~/.thinkdrop/search-browser`) — it never touches your signed-in
+  browser session or its cookies.
+- **Graceful degradation**: when an engine serves a consent wall or blocks
+  automated traffic, the chain automatically falls through to the next
+  provider, then to the LLM-fallback response — a search never hard-fails on
+  one engine's anti-bot posture.
+
 ## API Endpoints
 
 ### Health Check

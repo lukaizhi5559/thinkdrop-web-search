@@ -117,7 +117,8 @@ function extractSerp(opts = {}) {
       // offsetWidth covers lazy thumbs not yet loaded (CSS-sized cells);
       // applies to data: URIs too — Google inlines favicons as base64 as well.
       if (Math.max(img.naturalWidth || 0, img.width || 0, img.offsetWidth || 0) < 40) continue;
-      const area = (img.naturalWidth || img.width || 0) * (img.naturalHeight || img.height || 0);
+      const area = Math.max(img.naturalWidth || 0, img.width || 0, img.offsetWidth || 0)
+        * Math.max(img.naturalHeight || 0, img.height || 0, img.offsetHeight || 0);
       if (area > bestArea) { bestArea = area; best = img; }
     }
     return best;
@@ -228,21 +229,55 @@ function extractSerp(opts = {}) {
   const CHROME_ROLES = new Set(['button', 'menu', 'menubar', 'menuitem',
     'tooltip', 'status', 'alert', 'dialog', 'navigation', 'complementary',
     'tab', 'tablist', 'banner', 'contentinfo', 'search', 'form']);
+  // Mark label-anchored overview panels BEFORE extraction — Google ships the
+  // tail of an AI Overview (bullet lists, follow-up prompts, extra citations)
+  // inside hidden/aria-hidden subtrees behind a "Show more" toggle. That is
+  // answer content, not chrome: elements inside a marked panel get a pass on
+  // the hidden/clip pruning below (role/aria-live pruning still applies, so
+  // sr-only announcements and controls can't leak through).
+  for (const h of document.querySelectorAll('h1, h2, h3, div[role="heading"], strong')) {
+    if (!AI_OVERVIEW_LABELS.has(txt(h).trim().toLowerCase())) continue;
+    let node = h.parentElement;
+    for (let i = 0; i < 6 && node && node !== document.body; i++) {
+      node.setAttribute('data-td-overview', '1');
+      node = node.parentElement;
+    }
+  }
   const isChromeEl = (el) => {
     if (!el || el.nodeType !== 1) return false;
-    if (el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
+    const inOverview = !!el.closest('[data-td-overview]');
+    if (!inOverview && (el.hidden || el.getAttribute('aria-hidden') === 'true')) return true;
     const role = el.getAttribute('role');
     if (role && CHROME_ROLES.has(role)) return true;
     if (el.hasAttribute('aria-live')) return true;
     // display:none elements and 1px-clipped sr-only announcements — Google's
-    // a11y text ("AI Mode replied") lives here and innerText keeps it.
-    if ((el.offsetWidth || 0) <= 1 && (el.offsetHeight || 0) <= 1) return true;
+    // a11y text ("AI Mode replied") lives here and innerText keeps it. Inside
+    // a marked overview panel a clipped subtree can instead be the collapsed
+    // answer body or an inline cite phrase — any text-bearing node passes.
+    if ((el.offsetWidth || 0) <= 1 && (el.offsetHeight || 0) <= 1) {
+      return !(inOverview && (el.textContent || '').trim().length > 0);
+    }
+    if (inOverview) {
+      // Inside the answer panel, a strip of thumbnail-carrying tiles is the
+      // overview's source-carousel (Pinterest/Getty/IMDb cards at the panel
+      // foot) — presentation chrome, not answer text. Structure, not text
+      // share: ≥3 same-level children that each carry an <img> — prose
+      // bullets and paragraphs never pack image children like that.
+      const cardish = [...el.children].filter(k => k.querySelector && k.querySelector('img'));
+      if (cardish.length >= 3 && !el.hasAttribute('data-td-overview')) return true;
+      const imgAnchors = [...el.querySelectorAll('a')].filter(a => a.querySelector('img'));
+      if (imgAnchors.length >= 2) {
+        const linkChars = imgAnchors.reduce((n, a) =>
+          n + ((a.innerText || a.textContent || '').trim().length), 0);
+        if (linkChars / Math.max((el.textContent || '').trim().length, 1) > 0.5) return true;
+      }
+    }
     return false;
   };
   // Backstop line filter — role/hidden pruning (A3) removes chrome by
   // behavior; these exact-line drops catch strays that survive (e.g. chrome
   // rendered as plain divs). Exact-match only, so real prose can't hit it.
-  const CHROME_LINE_RE = /^(?:share public link|copy link|copied to clipboard|can'?t copy[^\n]*|learn more|good response|bad response|show all|show less|show more|read more|load more|view more|see more|dive deeper[^\n]*|listen|feedback|report|help|sign in|all|ai mode|ai overview|ai mode replied[^\n]*|images|videos|short videos|news|maps|shopping|forums|flights|finance|more|tools|web|share|facebook|gmail|x|reddit|whatsapp|export to \w+|people also ask|related searches|next|previous|close|about this result)\.?$/i;
+  const CHROME_LINE_RE = /^(?:share public link|copy link|copied to clipboard|can'?t copy[^\n]*|learn more|good response|bad response|show all|show less|show more|read more|load more|view more|see more|dive deeper[^\n]*|listen|feedback|report|help|sign in|all|ai mode|ai overview|ai mode replied[^\n]*|images|videos|short videos|news|maps|shopping|forums|flights|finance|more|tools|web|share|facebook|gmail|x|reddit|whatsapp|export to \w+|people also ask|related searches|next|previous|close|about this result|a copy of this chat[^\n]*|google may use[^\n]*|for legal issues[^\n]*|copied|failed to copy|copy|thanks for letting us know[^\n]*)\.?$/i;
   const cleanAiText = (t) => t
     .replace(/^#{0,6}\s*AI (Overview|Mode)[^\n]*\n?/i, '')
     .replace(/^#{0,6}\s*AI (Overview|Mode)\s*$/im, '')
@@ -252,6 +287,9 @@ function extractSerp(opts = {}) {
     // Truncation toggles concatenate inline at the end of innerText
     // ("...the constitution ...Read more") — strip anywhere they occur.
     .replace(/ ?(?:\.\.\.|…)? ?(?:read more|show more|view more|load more|see more)\.?(?=\s|$)/gi, '')
+    // Clipboard-toast fragments concatenate into one line ("CopiedFailed to
+    // copyCopy") — a line filter can't see inside a fused string.
+    .replace(/copied\s*failed to copy\s*copy/gi, '')
     .split('\n')
     .map(l => l.trim())
     .filter(l => !AI_OVERVIEW_LABELS.has(l.replace(/^#{1,6}\s*/, '').toLowerCase()))
@@ -325,8 +363,14 @@ function extractSerp(opts = {}) {
     let out = '';
     const direct = [];
     for (const c of el.childNodes || []) {
-      if (c.nodeType === 3) direct.push(c.nodeValue);
-      else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName) && !BLOCK_MD.has(c.tagName) && !isChromeEl(c)) direct.push(mdInline(c));
+      if (c.nodeType === 3) { direct.push(c.nodeValue); continue; }
+      if (c.nodeType !== 1 || SKIP_MD.has(c.tagName) || BLOCK_MD.has(c.tagName)) continue;
+      // Inside a marked overview panel a bare <a> carrying a thumbnail (or
+      // card-length text) is a source-carousel tile, not an inline cite —
+      // prose links live inside P/DIV and never reach this loop.
+      if (c.tagName === 'A' && c.closest('[data-td-overview]')
+          && (c.querySelector('img') || (c.textContent || '').trim().length > 60)) continue;
+      if (!isChromeEl(c)) direct.push(mdInline(c));
     }
     const lead = direct.join('').replace(/\s+/g, ' ').trim();
     if (lead) out += lead + '\n\n';
@@ -380,7 +424,11 @@ function extractSerp(opts = {}) {
   // answer body, not the whole panel wrapper (which scores worse — more
   // buttons/menus per char of prose).
   const scoreCandidate = (el) => {
-    const t = (el.innerText || '').trim();
+    // innerText excludes display:none/clipped subtrees — a marked overview
+    // panel measures its collapsed body via textContent so a panel that hides
+    // most of its answer behind "Show more" still outranks a small lead block.
+    const inOverview = !!el.querySelector('[data-td-overview]') || el.hasAttribute('data-td-overview');
+    const t = (inOverview ? (el.textContent || '') : (el.innerText || '')).trim();
     const desc = el.querySelectorAll('*').length || 1;
     const density = t.length / desc;
     const interactive = el.querySelectorAll(
@@ -425,11 +473,28 @@ function extractSerp(opts = {}) {
     .filter(c => !(c.socialHits >= 3 && !c.labelBonus))
     .sort((a, b) => b.s - a.s)
     .slice(0, 6);
+  // A SERP card caption ("Title | Site | Domain" / a site name repeated on
+  // its own line) is not an overview — short text with pipe separators or a
+  // trailing site-name line gets rejected even at the fallback, because no
+  // overview beats a mislabeled result card.
+  const isCaptionShape = (t) => {
+    if (!t || t.length >= 200) return false;
+    const ls = t.split('\n').map(l => l.trim()).filter(Boolean);
+    if (/\|\s*\S/.test(t)) return true;
+    if (ls.length >= 2 && ls[0].includes(ls[ls.length - 1])) return true;
+    return false;
+  };
   let _bestRejected = null;
   for (const { el: cand } of _ranked) {
-    const md = mdBlocks(cand).trim();
-    const t = cleanAiText(md.length > 40 ? md : (cand.innerText || ''));
-    if (t.length <= 80) continue;
+    // A winning wrapper may outscore on raw text yet hold the overview plus
+    // unrelated sections (related panels, shopping cards). Extract from the
+    // marked panel boundary inside it instead — querySelectorAll returns
+    // outermost-first, and the outermost marked node IS the panel root.
+    const target = cand.hasAttribute('data-td-overview') ? cand
+      : (cand.querySelector('[data-td-overview]') || cand);
+    const md = mdBlocks(target).trim();
+    const t = cleanAiText(md.length > 40 ? md : (target.innerText || ''));
+    if (t.length <= 80 || isCaptionShape(t)) continue;
     // Sanity check — a candidate that's still >15% UI lines after pruning is
     // chrome, not answer; try the next-best candidate instead of shipping it.
     if (chromeRatio(t) <= 0.15) { out.aiOverview = t; break; }
@@ -455,16 +520,20 @@ function extractSerp(opts = {}) {
   // Localized section headings — a non-English query (hl=<lang>) renders
   // native labels, so match both English and common localizations.
   const sectionLabels = {
-    'images': 'image', 'videos': 'video', 'top stories': 'news',
-    'top news': 'news', 'news': 'news',
-    '图片': 'image', '视频': 'video', '热门故事': 'news', '新闻': 'news', '资讯': 'news', // zh
-    '画像': 'image', '動画': 'video', 'トップニュース': 'news', 'ニュース': 'news',      // ja
-    '이미지': 'image', '동영상': 'video', '주요 뉴스': 'news', '뉴스': 'news',            // ko
-    'imágenes': 'image', 'vídeos': 'video', 'videos': 'video', 'noticias': 'news',
-    'principales noticias': 'news',                                                // es
-    'bilder': 'image', 'nachrichten': 'news', 'schlagzeilen': 'news',                // de
-    'imagenes': 'image', 'actualités': 'news', 'à la une': 'news',                   // fr
-    'imagens': 'image', 'vídeos em destaque': 'video', 'principais notícias': 'news' // pt
+    'images': 'image', 'videos': 'video', 'short videos': 'video',
+    'shorts': 'video', 'top stories': 'news', 'top news': 'news', 'news': 'news',
+    '图片': 'image', '视频': 'video', '短视频': 'video',
+    '热门故事': 'news', '新闻': 'news', '资讯': 'news',                        // zh
+    '画像': 'image', '動画': 'video', 'ショート動画': 'video',
+    'トップニュース': 'news', 'ニュース': 'news',                                // ja
+    '이미지': 'image', '동영상': 'video', '짧은 동영상': 'video',
+    '주요 뉴스': 'news', '뉴스': 'news',                                          // ko
+    'imágenes': 'image', 'vídeos': 'video', 'videos': 'video', 'vídeos cortos': 'video',
+    'noticias': 'news', 'principales noticias': 'news',                        // es
+    'bilder': 'image', 'kurzvideos': 'video', 'nachrichten': 'news', 'schlagzeilen': 'news', // de
+    'imagenes': 'image', 'vidéos courtes': 'video', 'actualités': 'news', 'à la une': 'news', // fr
+    'imagens': 'image', 'vídeos em destaque': 'video', 'vídeos curtos': 'video',
+    'principais notícias': 'news' // pt
   };
   const sectionHeadingSel = 'h1, h2, h3, div[role="heading"], g-link, a[aria-label], span, strong';
   out.debug = out.debug || {};
@@ -472,6 +541,7 @@ function extractSerp(opts = {}) {
     const label = (txt(h) || h.getAttribute('aria-label') || '').trim().toLowerCase();
     const type = sectionLabels[label];
     if (!type) continue;
+    if (type === 'video') out.hasVideoHeading = true;
     let box = h.parentElement;
     for (let i = 0; i < 6 && box; i++) {
       // All-tab Images strip cells: the photo thumb is NOT inside the link —
@@ -489,23 +559,33 @@ function extractSerp(opts = {}) {
       if (mediaCards.length >= 2) {
         for (const a of mediaCards) {
           if (!a.href || seen.has(a.href)) continue;
-          // Image-strip cards link via google.com/imgres — unwrap the real
-          // source page (imgrefurl) + full-res (imgurl) so clicks land on the
-          // site, not a Google redirect. Only skip if still google-internal.
+          // Vertical cards link via google.com/imgres / /url redirects —
+          // unwrap the real destination (imgrefurl/url/q) plus the full-res
+          // image (imgurl) so clicks land on the site, not a Google redirect.
+          // Applies to images AND videos/news tiles alike; only skip when the
+          // link stays google-internal after unwrapping (opaque /goto tokens).
           let href = a.href, imageUrl;
-          if (type === 'image' && isGoogleUrl(href)) {
+          if (isGoogleUrl(href)) {
             try {
               const u = new URL(href);
-              const ref = u.searchParams.get('imgrefurl') || u.searchParams.get('url') || u.searchParams.get('q');
+              const ref = u.searchParams.get('imgrefurl') || u.searchParams.get('url')
+                || u.searchParams.get('q') || u.searchParams.get('uddg');
               const img = u.searchParams.get('imgurl') || u.searchParams.get('uddg');
               if (ref && !isGoogleUrl(ref)) href = ref;
-              if (img && !isGoogleUrl(img)) imageUrl = img;
+              if (type === 'image' && img && !isGoogleUrl(img)) imageUrl = img;
             } catch (_) {}
           }
-          if (isGoogleUrl(href)) continue;
-          const t = txt(a);
+          // Keep /goto wrapped links — unwrapGoogleUrls resolves them
+          // server-side (image tiles survive via emitImageFromThumb the same
+          // way). Only other google-internal links (/search chips) are junk.
+          if (isGoogleUrl(href) && !href.includes('/goto')) continue;
+          const t = txt(a) || txt(a.parentElement);
           if (t.length < 8) continue;
-          const img = biggestImg(a);
+          // Short-video tiles are small portrait thumbs — below biggestImg's
+          // 40px floor — so fall back to the anchor's first non-icon img.
+          const img = biggestImg(a)
+            || [...a.querySelectorAll('img')].find(i => (i.src || i.dataset?.src) && !BAD_IMG.test(i.src || ''))
+            || [...(a.parentElement?.querySelectorAll('img') || [])].find(i => (i.src || i.dataset?.src) && !BAD_IMG.test(i.src || ''));
           const dur = (t.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/) || [])[0];
           seen.add(a.href);
           out.results.push({
@@ -523,7 +603,6 @@ function extractSerp(opts = {}) {
       box = box.parentElement;
     }
   }
-
   // ── 4. Organic links — anchors wrapping an h3 (Google's stable signal) ──
   const VIDEO_HOSTS = /youtube\.com\/watch|youtu\.be\/|vimeo\.com\/\d|tiktok\.com\/@|dailymotion\.com\/video/i;
   for (const h3 of document.querySelectorAll('a h3')) {
@@ -747,7 +826,8 @@ function extractVideoList() {
       // offsetWidth covers lazy thumbs not yet loaded (CSS-sized cells);
       // applies to data: URIs too — Google inlines favicons as base64 as well.
       if (Math.max(img.naturalWidth || 0, img.width || 0, img.offsetWidth || 0) < 40) continue;
-      const area = (img.naturalWidth || img.width || 0) * (img.naturalHeight || img.height || 0);
+      const area = Math.max(img.naturalWidth || 0, img.width || 0, img.offsetWidth || 0)
+        * Math.max(img.naturalHeight || 0, img.height || 0, img.offsetHeight || 0);
       if (area > bestArea) { bestArea = area; best = img; }
     }
     return best;
@@ -759,7 +839,9 @@ function extractVideoList() {
       const u = new URL(href, location.origin);
       if (u.pathname === '/url' && u.searchParams.get('q')) href = u.searchParams.get('q');
     } catch (_) {}
-    if (href.includes('google.com/') || seen.has(href)) continue;
+    // /goto wrapped links pass through — unwrapGoogleUrls resolves them
+    // server-side; only other google-internal links are junk.
+    if ((href.includes('google.com/') && !href.includes('/goto')) || seen.has(href)) continue;
     // climb to the card so title/duration/summary text is captured
     let card = a, t = '';
     for (let i = 0; i < 5 && card; i++) {
@@ -873,6 +955,46 @@ export async function searchGoogleSerp(query, options = {}) {
       if (lite.items.length) options.onPartial({ items: lite.items, sources: lite.sources, provider: 'google-serp' });
     } catch (_) {}
   }
+
+  // Expand collapsed AI Overview panels — Google lazy-renders the tail
+  // (bullet lists, deep citations) on the "Show more" click. aria-expanded
+  // is language-independent; the text match is the fallback. Inside the
+  // labelled panel only, so random page expanders can't fire.
+  try {
+    await page.evaluate(() => {
+      const LABELS = /^(ai overview|ai mode|ai 概[览要]|ai概要|ai 개요|resumen de ia|descripción general de ia|présentation de l'ia|aperçu (de l'|)ia|ki-übersicht|ki übersicht|visão geral de ia|обзор от ии)$/i;
+      for (const h of document.querySelectorAll('h1,h2,h3,div[role="heading"],strong')) {
+        if (!LABELS.test((h.innerText || '').trim())) continue;
+        let n = h.parentElement;
+        for (let i = 0; i < 8 && n && n !== document.body; i++) {
+          // Click EVERY collapsed expander in the panel — the body, bullet
+          // list, and source strip can each carry their own toggle.
+          const btns = [...n.querySelectorAll('[aria-expanded="false"], button, [role="button"], a')]
+            .filter(b => b.getAttribute('aria-expanded') === 'false'
+              || /^(show more|read more|view more|load more|see more|expand|show all)\.?$/i.test((b.innerText || '').trim()));
+          for (const b of btns) { try { b.click(); } catch (_) {} }
+          if (btns.length) return;
+          n = n.parentElement;
+        }
+      }
+    });
+    await page.waitForTimeout(600);
+  } catch (_) {}
+
+  // Lazy media strips (Short videos carousel, image-grid tiles) mount when
+  // they enter the viewport — the "short videos" heading can be present with
+  // zero tiles beneath it until a scroll. Nudge to the bottom and back.
+  try {
+    await page.evaluate(async () => {
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      const h = document.body.scrollHeight;
+      // Stepped descent — each lazy region must hold the viewport briefly or
+      // the strip's tiles never mount (a single jump races past them).
+      for (const y of [h * 0.33, h * 0.66, h]) { window.scrollTo(0, y); await sleep(350); }
+      window.scrollTo(0, 0);
+    });
+    await page.waitForTimeout(300);
+  } catch (_) {}
 
   let extracted = await page.evaluate(extractSerp, { intent: options.intent });
 
@@ -991,13 +1113,40 @@ export async function searchGoogleSerp(query, options = {}) {
   // renderer gives them the media-card treatment, and rank them first.
   if (intent === 'image') {
     for (const r of results) {
-      if (r.type !== 'image' && (r.thumbnail || r.imageUrl)) r.type = 'image';
+      if (r.type === 'web-result' && (r.thumbnail || r.imageUrl)) r.type = 'image';
     }
     if (!results.some(r => r.type === 'image')) {
       console.log(`[google-serp] image intent but 0 images — headings: ${JSON.stringify(extracted.debug?.headings || [])}`);
       console.log(`[google-serp] img sizes: ${JSON.stringify(extracted.debug?.imgs || [])}`);
     }
     results = [...results.filter(r => r.type === 'image'), ...results.filter(r => r.type !== 'image')];
+  }
+
+  // Short-videos recovery — the heading can sit in the served DOM while the
+  // carousel tiles lazy-mount unreliably in a minimized window. The Videos
+  // tab is a server-rendered list: one hop when a video strip was implied
+  // but nothing was extracted.
+  if ((intent === 'video' || intent === 'image')
+      && extracted.hasVideoHeading
+      && results.filter(r => r.type === 'video').length < 2
+      && !searchBrowser.paceExceeded('google')) {
+    try {
+      console.log(`[google-serp] video recovery — ${results.filter(r => r.type === 'video').length} inline videos, trying tbm=vid`);
+      if (typeof options.onPartial === 'function' && results.length) {
+        try { options.onPartial({ items: results, provider: 'google-serp' }); } catch (_) {}
+      }
+      await page.goto(`${url}&tbm=vid`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+      await page.waitForFunction(() => document.querySelectorAll('a[href] img').length > 4, { timeout: 2500 }).catch(() => {});
+      const vids = await page.evaluate(extractVideoList);
+      const have = new Set(results.map(r => r.url));
+      const fresh = vids.filter(v => !have.has(v.url)).slice(0, 6);
+      if (fresh.length) {
+        console.log(`[google-serp] tbm=vid recovery: +${fresh.length} videos`);
+        results = [...results, ...fresh];
+      }
+    } catch (e) {
+      console.log(`[google-serp] tbm=vid recovery failed: ${e.message}`);
+    }
   }
 
   results = results.slice(0, maxResults).map((r, i) => ({

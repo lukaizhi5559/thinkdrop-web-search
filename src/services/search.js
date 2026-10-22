@@ -244,7 +244,14 @@ export async function search(query, options = {}, context = {}) {
   // "N comments/reactions/time-ago" markers mean a discussions carousel was
   // mis-scored as the AI Overview. Evict and re-scrape.
   const junkOverview = cached?.aiOverview
-    && ((cached.aiOverview.match(/\b[\d.,]+k?\+?\s*(?:comments?|reactions?|likes|views|reposts)\b|\b\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/gi) || []).length >= 3);
+    && (((cached.aiOverview.match(/\b[\d.,]+k?\+?\s*(?:comments?|reactions?|likes|views|reposts)\b|\b\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/gi) || []).length >= 3)
+      // ...or a result-card caption shipped as an overview — short text with
+      // "Title | Site | Domain" separators, or a trailing site-name line.
+      || (cached.aiOverview.length < 200 && (() => {
+        const _ls = cached.aiOverview.split('\n').map(l => l.trim()).filter(Boolean);
+        return /\|\s*\S/.test(cached.aiOverview)
+          || (_ls.length >= 2 && _ls[0].includes(_ls[_ls.length - 1]));
+      })()));
   if (cached && (missingMedia || junkOverview || isLoginWallJunk(cached.results) || (!mediaIntent && !resultsMatchQuery(query, cached.results)) || isFaviconJunk(cached.results) || isBreadcrumbJunk(cached.results))) {
     // Junk scraped before the guards existed (sign-in wall, or a degraded
     // query-agnostic SERP) — evict and fall through to a live search.

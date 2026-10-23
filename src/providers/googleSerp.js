@@ -108,6 +108,33 @@ function extractSerp(opts = {}) {
   const seen = new Set();
   const isGoogleUrl = (u) => { try { return new URL(u).hostname.endsWith('google.com'); } catch (_) { return true; } };
   const BAD_IMG = /logo|favicon|s2\/favicons|gstatic\.com\/.*nav/i;
+  // Google's lazy img src is a data-URI placeholder until a script swaps it —
+  // the page's script text carries a "dimg_id":"https:\/\/..." map of the real
+  // URLs. Build it once so placeholder imgs resolve to their posters.
+  const _dimgMap = (() => {
+    const map = {};
+    try {
+      for (const s of document.scripts) {
+        const t = s.textContent || '';
+        for (const m of t.matchAll(/"(dimg_[^"]+)":"([^"]+)"/g)) {
+          if (/encrypted-tbn|gstatic|ggpht|ytimg/i.test(m[2])) {
+            map[m[1]] = m[2]
+              .replace(/\\u003d/g, '=').replace(/\\u0026/g, '&')
+              .replace(/\\u002f/gi, '/').replace(/\\\//g, '/');
+          }
+        }
+      }
+    } catch (_) {}
+    return map;
+  })();
+  // Real thumb src for a possibly-lazy img: data-URI placeholder → the
+  // script-map URL; http(s)/dataset.src pass through.
+  const resolveImgSrc = (img) => {
+    if (!img) return undefined;
+    const src = img.src || img.dataset?.src || '';
+    if (/^\s*data:image\//.test(src) && img.id && _dimgMap[img.id]) return _dimgMap[img.id];
+    return src || undefined;
+  };
   // An anchor holding a media card contains BOTH the content thumbnail and a
   // small source favicon — pick the largest img, skipping known icon URLs.
   const biggestImg = (root) => {
@@ -170,7 +197,7 @@ function extractSerp(opts = {}) {
       url: href,
       imageUrl,
       description: t.split('\n').slice(1).join(' ').slice(0, 300),
-      thumbnail: im.src,
+      thumbnail: resolveImgSrc(im) || im.src,
       type: 'image'
     });
   };
@@ -250,7 +277,14 @@ function extractSerp(opts = {}) {
     const inOverview = !!el.closest('[data-td-overview]');
     if (!inOverview && (el.hidden || el.getAttribute('aria-hidden') === 'true')) return true;
     const role = el.getAttribute('role');
-    if (role && CHROME_ROLES.has(role)) return true;
+    if (role && CHROME_ROLES.has(role)) {
+      // Inside a marked panel, <span role="button"> chips are INLINE citation
+      // links ("French Bulldog", "Pomeranian" mid-sentence) — their text is
+      // answer content. Real controls are <button> elements or div[role=*].
+      const citeChip = inOverview && el.tagName === 'SPAN'
+        && !el.querySelector('button,[role="menu"],[role="dialog"],ul,ol');
+      if (!citeChip) return true;
+    }
     if (el.hasAttribute('aria-live')) return true;
     // display:none elements and 1px-clipped sr-only announcements — Google's
     // a11y text ("AI Mode replied") lives here and innerText keeps it. Inside
@@ -267,6 +301,24 @@ function extractSerp(opts = {}) {
       // bullets and paragraphs never pack image children like that.
       const cardish = [...el.children].filter(k => k.querySelector && k.querySelector('img'));
       if (cardish.length >= 3 && !el.hasAttribute('data-td-overview')) return true;
+      // Source-card strip — each row carries a "+N related results" chip
+      // (button[data-amic]) or a site-favicon anchor (a.PMDqCb, aria-label
+      // only). ≥2 chips = the list container — but only prune when the
+      // chip-carrying rows dominate, so a shared panel wrapper (prose +
+      // cards) survives to be walked. 1 chip + multi-line text = one row
+      // reached on its own.
+      const srcChips = [...el.querySelectorAll('[data-amic], button[aria-label*="related result" i], a[class*="PMDqCb"], a[class*="POYEld"], button[aria-label="About this result" i]')];
+      if (srcChips.length >= 2) {
+        let cardChars = 0;
+        for (const ch of srcChips) {
+          let row = ch;
+          while (row.parentElement && row.parentElement !== el) row = row.parentElement;
+          cardChars += (row.innerText || '').trim().length;
+        }
+        if (cardChars / Math.max((el.innerText || '').trim().length, 1) > 0.6) return true;
+      }
+      if (srcChips.length === 1
+          && (el.innerText || '').split('\n').filter(l => l.trim()).length >= 2) return true;
       // A lone card-anchor — an <a> carrying a thumb with multi-line card
       // text (title + site + age/duration, e.g. the panel-foot video card).
       // querySelectorAll('a') can't see el itself, so this needs its own rule.
@@ -301,28 +353,45 @@ function extractSerp(opts = {}) {
   // behavior; these exact-line drops catch strays that survive (e.g. chrome
   // rendered as plain divs). Exact-match only, so real prose can't hit it.
   const CHROME_LINE_RE = /^(?:share public link|copy link|copied to clipboard|can'?t copy[^\n]*|learn more|good response|bad response|show all|show less|show more|read more|load more|view more|see more|dive deeper[^\n]*|listen|feedback|report|help|sign in|all|ai mode|ai overview|ai mode replied[^\n]*|images|videos|short videos|news|maps|shopping|forums|flights|finance|more|tools|web|share|facebook|gmail|x|reddit|whatsapp|export to \w+|people also ask|related searches|next|previous|close|about this result|a copy of this chat[^\n]*|google may use[^\n]*|for legal issues[^\n]*|copied|failed to copy|copy|thanks for letting us know[^\n]*)\.?$/i;
-  const cleanAiText = (t) => t
-    .replace(/^#{0,6}\s*AI (Overview|Mode)[^\n]*\n?/i, '')
-    .replace(/^#{0,6}\s*AI (Overview|Mode)\s*$/im, '')
-    // "+N" citation chips concatenated into prose by innerText (the DOM→md
-    // path already converts them to [n] markers — this catches the fallback).
-    .replace(/ ?\+\d{1,2}(?=\s|$)/gm, '')
-    // Truncation toggles concatenate inline at the end of innerText
-    // ("...the constitution ...Read more") — strip anywhere they occur.
-    .replace(/ ?(?:\.\.\.|…)? ?(?:read more|show more|view more|load more|see more)\.?(?=\s|$)/gi, '')
-    // Clipboard-toast fragments concatenate into one line ("CopiedFailed to
-    // copyCopy") — a line filter can't see inside a fused string.
-    .replace(/copied\s*failed to copy\s*copy/gi, '')
-    .split('\n')
-    .map(l => l.trim())
-    .filter(l => !AI_OVERVIEW_LABELS.has(l.replace(/^#{1,6}\s*/, '').toLowerCase()))
-    .filter(l => l && !/[{;}]|function\s*\(|window\.|try\s*\{|\.rll\(|var |const |=>/.test(l)
-             && !CHROME_LINE_RE.test(l.replace(/^#{1,6}\s*/, ''))
-             && !/^ai mode replied?$/i.test(l))
-    .join('\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .slice(0, 4000)
-    .trim();
+  const cleanAiText = (t) => {
+    const cleaned = t
+      .replace(/^#{0,6}\s*AI (Overview|Mode)[^\n]*\n?/i, '')
+      .replace(/^#{0,6}\s*AI (Overview|Mode)\s*$/im, '')
+      // "+N" citation chips concatenated into prose by innerText (the DOM→md
+      // path already converts them to [n] markers — this catches the fallback).
+      .replace(/ ?\+\d{1,2}(?=\s|$)/gm, '')
+      // Truncation toggles concatenate inline at the end of innerText
+      // ("...the constitution ...Read more") — strip anywhere they occur.
+      .replace(/ ?(?:\.\.\.|…)? ?(?:read more|show more|view more|load more|see more)\.?(?=\s|$)/gi, '')
+      // Clipboard-toast fragments concatenate into one line ("CopiedFailed to
+      // copyCopy") — a line filter can't see inside a fused string.
+      .replace(/copied\s*failed to copy\s*copy/gi, '')
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => !AI_OVERVIEW_LABELS.has(l.replace(/^#{1,6}\s*/, '').toLowerCase()))
+      .filter(l => l && !/[{;}]|function\s*\(|window\.|try\s*\{|\.rll\(|var |const |=>/.test(l)
+               && !CHROME_LINE_RE.test(l.replace(/^#{1,6}\s*/, ''))
+               && !/^ai mode replied?$/i.test(l));
+    // Source-card tail — variants where the strip's DOM isn't chrome-flagged
+    // still emit its flat text: a bare site-name line immediately followed by
+    // its own "Title | Site" line is a SERP card, not overview prose. Cut the
+    // text at the first such pair (real prose never titles itself by site).
+    let cut = cleaned.length;
+    for (let i = 0; i < cleaned.length - 1; i++) {
+      const name = cleaned[i], next = cleaned[i + 1];
+      if (name.length > 2 && name.length <= 40 && !/[.!?,:;]$/.test(name)
+          && new RegExp(`\\s[|·-]\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i').test(next)) {
+        // Require a second card-ish pair nearby so a stray "Title | X" line in
+        // real prose can't truncate the answer.
+        const rest = cleaned.slice(i + 1, i + 8);
+        if (rest.some((l, j) => j > 0 && /\s[|·-]\s*\S.{2,}$/.test(l))) { cut = i; break; }
+      }
+    }
+    return cleaned.slice(0, cut).join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .slice(0, 4000)
+      .trim();
+  };
   // Translate the overview's native DOM into markdown — headings, lists,
   // tables, bold, and real links survive; innerText flattens all of it and
   // concatenates "+N" citation chips into the prose. Citation chips/sup
@@ -367,7 +436,9 @@ function extractSerp(opts = {}) {
       if (c.nodeType === 3) parts.push(c.nodeValue);
       else if (c.nodeType === 1 && !SKIP_MD.has(c.tagName) && !isChromeEl(c)) {
         if (c.tagName === 'UL' || c.tagName === 'OL') {
-          const items = [...c.children].filter(x => x.tagName === 'LI');
+          // Items owned by THIS list — Google can wrap <li>s in <div>s inside
+          // the <ul>, while a nested list's <li>s keep their own inner list.
+          const items = [...c.querySelectorAll('li')].filter(x => x.closest('ul,ol') === c);
           nested += '\n' + items.map((x, i) => `  ${c.tagName === 'OL' ? `${i + 1}.` : '-'} ${mdItem(x)}`).join('\n');
         } else parts.push(mdInline(c));
       }
@@ -402,7 +473,9 @@ function extractSerp(opts = {}) {
       if (SKIP_MD.has(tag) || isChromeEl(c) || !(c.textContent || '').trim()) continue;
       if (/^H[1-6]$/.test(tag)) { const t = mdInline(c).trim(); if (t) out += `${'#'.repeat(+tag[1])} ${t}\n\n`; continue; }
       if (tag === 'UL' || tag === 'OL') {
-        const items = [...c.children].filter(li => li.tagName === 'LI');
+        // Items owned by THIS list — Google can wrap <li>s in <div>s inside
+        // the <ul>, while a nested list's <li>s keep their own inner list.
+        const items = [...c.querySelectorAll('li')].filter(li => li.closest('ul,ol') === c);
         if (items.length) out += items.map((li, i) => `${tag === 'OL' ? `${i + 1}.` : '-'} ${mdItem(li)}`).join('\n') + '\n\n';
         continue;
       }
@@ -415,6 +488,22 @@ function extractSerp(opts = {}) {
       // emitting them again explodes token spans into one line each.
     }
     return out;
+  };
+  // Plain-text fallback for when mdBlocks collapses to nothing — MUST keep
+  // isChromeEl pruning: a raw innerText read re-admits every source-card /
+  // related-results strip the markdown walk correctly skipped.
+  const prunedText = (el) => {
+    const parts = [];
+    const walk = (n) => {
+      for (const c of n.childNodes || []) {
+        if (c.nodeType === 3) { parts.push(c.nodeValue); continue; }
+        if (c.nodeType !== 1 || SKIP_MD.has(c.tagName) || isChromeEl(c)) continue;
+        walk(c);
+        if (BLOCK_MD.has(c.tagName) || /^H[1-6]$/.test(c.tagName) || c.tagName === 'LI') parts.push('\n');
+      }
+    };
+    walk(el);
+    return parts.join('').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   };
   // Candidate pool = every substantial block that renders BEFORE the first
   // organic result in the main column, in READING ORDER — ancestors of the
@@ -508,6 +597,9 @@ function extractSerp(opts = {}) {
     // Single-line product/result-card titles — slash- or dash-separated
     // fragments ("X / Standee - Dark Knight Style"), no sentence punctuation.
     if (ls.length === 1 && /[/–—]|\s-\s/.test(ls[0]) && !/[.!?]$/.test(ls[0])) return true;
+    // Shopping-caption titles — a long comma-list of product fragments
+    // ("png bundle, clipart set, super hero png, instant download").
+    if (ls.length === 1 && ls[0].split(',').length >= 4 && !/[.!?]$/.test(ls[0])) return true;
     return false;
   };
   let _bestRejected = null;
@@ -519,18 +611,58 @@ function extractSerp(opts = {}) {
     const target = cand.hasAttribute('data-td-overview') ? cand
       : (cand.querySelector('[data-td-overview]') || cand);
     let md = mdBlocks(target).trim();
-    let t = cleanAiText(md.length > 40 ? md : (target.innerText || ''));
+    let t = cleanAiText(md.length > 40 ? md : prunedText(target));
     // AI-Mode variants mark a reply box that's pure UI chrome (share/copy/
     // feedback) while the real answer prose sits elsewhere in the winner —
     // when the panel extracts to nothing, retry on the candidate itself.
     if (t.length <= 80 && target !== cand) {
       md = mdBlocks(cand).trim();
-      t = cleanAiText(md.length > 40 ? md : (cand.innerText || ''));
+      t = cleanAiText(md.length > 40 ? md : prunedText(cand));
     }
     if (t.length <= 80 || isCaptionShape(t)) continue;
     // Sanity check — a candidate that's still >15% UI lines after pruning is
     // chrome, not answer; try the next-best candidate instead of shipping it.
-    if (chromeRatio(t) <= 0.15) { out.aiOverview = t; break; }
+    if (chromeRatio(t) <= 0.15) {
+      out.aiOverview = t;
+      // TEMP-DIAG: dump the winning target's interactive elements + tail structure
+      try {
+        out.debug = out.debug || {};
+        out.debug.winner = {
+          tag: target.tagName, cls: (target.className || '').toString().slice(0, 50),
+          links: [...target.querySelectorAll('a,button,[role="button"]')].slice(0, 30).map(x => ({
+            tag: x.tagName, txt: (x.innerText || '').trim().slice(0, 35), tc: (x.textContent || '').trim().slice(0, 35),
+            aria: (x.getAttribute('aria-label') || '').slice(0, 30),
+            html: x.outerHTML.slice(0, 160),
+          })),
+          stripPath: (() => {
+            const w = target.querySelector('a[class*="PMDqCb"], [data-amic]')
+              || [...target.querySelectorAll('div,p,span')].filter(x => /Petfinder|Chewy|Spruce/i.test(x.innerText || '') && (x.innerText || '').trim().length < 300).pop();
+            if (!w) return null;
+            const chain = [];
+            let n = w;
+            for (let i = 0; i < 8 && n && n !== target; i++) {
+              const sigs = n.querySelectorAll('[data-amic], a[class*="PMDqCb"], a[class*="POYEld"], button[aria-label*="related result" i], button[aria-label="About this result" i]');
+              let share = 0;
+              if (sigs.length >= 2) {
+                let cc = 0;
+                for (const ch of sigs) { let row = ch; while (row.parentElement && row.parentElement !== n) row = row.parentElement; cc += (row.innerText || '').trim().length; }
+                share = cc / Math.max((n.innerText || '').trim().length, 1);
+              }
+              chain.push({ lvl: i, tag: n.tagName, sigs: sigs.length, share: +share.toFixed(2), chrome: isChromeEl(n), role: n.getAttribute('role') || undefined, kids: n.children.length, txt: (n.innerText || '').trim().slice(0, 60) });
+              n = n.parentElement;
+            }
+            return chain;
+          })(),
+          tailKids: [...(target.lastElementChild?.children || [])].slice(0, 10).map(x => ({
+            tag: x.tagName, a: x.querySelectorAll('a').length, imgs: x.querySelectorAll('img').length,
+            lines: (x.innerText || '').split('\n').filter(l => l.trim()).length,
+            txt: (x.innerText || '').trim().slice(0, 50),
+          })),
+          md: md.slice(0, 3000),
+        };
+      } catch (_) {}
+      break;
+    }
     if (!_bestRejected) _bestRejected = t;
   }
   // Everything scored as chrome — keep the least-bad pick rather than nothing,
@@ -549,7 +681,7 @@ function extractSerp(opts = {}) {
         let sib = node.nextElementSibling;
         for (let j = 0; j < 3 && sib; j++) {
           const md = mdBlocks(sib).trim();
-          const t = cleanAiText(md.length > 40 ? md : (sib.innerText || ''));
+          const t = cleanAiText(md.length > 40 ? md : prunedText(sib));
           if (t.length > 80 && !isCaptionShape(t) && chromeRatio(t) <= 0.15) { out.aiOverview = t; break; }
           sib = sib.nextElementSibling;
         }
@@ -634,19 +766,42 @@ function extractSerp(opts = {}) {
           if (isGoogleUrl(href) && !href.includes('/goto')) continue;
           const t = txt(a) || txt(a.parentElement);
           if (t.length < 8) continue;
+          // Tiles can split into TWO anchors sharing the href — a bare
+          // title anchor (its only img is the site favicon) and a poster
+          // anchor carrying the real thumb + aria-label. The picked anchor
+          // may be the bare one, so climb until an ancestor holds a
+          // CONTENT img (real/poster-sized or script-mapped) before hunting.
+          const hasContentImg = (root) => [...(root?.querySelectorAll('img') || [])].some(i => {
+            const s = i.src || i.dataset?.src || '';
+            if (i.id && _dimgMap[i.id]) return true;
+            const w = Math.max(i.naturalWidth || 0, i.width || 0, i.offsetWidth || 0);
+            return w >= 40 && !BAD_IMG.test(s);
+          });
+          let imgScope = a;
+          for (let k = 0; k < 4 && imgScope && !hasContentImg(imgScope); k++) imgScope = imgScope.parentElement;
+          if (!imgScope || !hasContentImg(imgScope)) imgScope = a;
           // Short-video tiles are small portrait thumbs — below biggestImg's
-          // 40px floor — so fall back to the anchor's first non-icon img.
-          const img = biggestImg(a)
-            || [...a.querySelectorAll('img')].find(i => (i.src || i.dataset?.src) && !BAD_IMG.test(i.src || ''))
-            || [...(a.parentElement?.querySelectorAll('img') || [])].find(i => (i.src || i.dataset?.src) && !BAD_IMG.test(i.src || ''));
-          const dur = (t.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/) || [])[0];
+          // 40px floor — so fall back to the anchor's imgs directly. Prefer an
+          // http(s) src: a 28px data-URI is Google's pre-swap lazy placeholder,
+          // not content (the real poster lands once the strip holds viewport).
+          const httpImg = (root) => [...(root?.querySelectorAll('img') || [])]
+            .find(i => /^https?:/.test(i.src || i.dataset?.src || '') && !BAD_IMG.test(i.src || i.dataset?.src || ''));
+          // Lazy placeholder img whose real URL sits in the script map.
+          const lazyImg = (root) => [...(root?.querySelectorAll('img') || [])]
+            .find(i => i.id && _dimgMap[i.id] && !BAD_IMG.test(_dimgMap[i.id]));
+          const img = biggestImg(imgScope) || httpImg(imgScope) || lazyImg(imgScope)
+            || [...imgScope.querySelectorAll('img')].find(i => !/^\s*data:image\//.test(i.src || '')
+                && (i.src || i.dataset?.src) && !BAD_IMG.test(i.src || ''));
+          const tileText = `${t} ${(imgScope.innerText || '')} ${a.getAttribute('aria-label') || ''}`
+            + ` ${[...imgScope.querySelectorAll('a[aria-label]')].map(x => x.getAttribute('aria-label') || '').join(' ')}`;
+          const dur = (tileText.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/) || [])[0];
           seen.add(a.href);
           out.results.push({
             title: t.split('\n')[0].slice(0, 140),
             url: href,
             imageUrl,
             description: t.split('\n').slice(1).join(' ').slice(0, 300),
-            thumbnail: img ? (img.src || img.dataset?.src || undefined) : undefined,
+            thumbnail: resolveImgSrc(img),
             duration: type === 'video' ? dur : undefined,
             type
           });
@@ -870,6 +1025,24 @@ function extractVideoList() {
   const out = [];
   const seen = new Set();
   const BAD_IMG = /logo|favicon|s2\/favicons|gstatic\.com\/.*nav/i;
+  // Same dimg_→real-URL script map as extractSerp — lazy imgs hold data-URI
+  // placeholders until the swap, and the tab may render before it fires.
+  const _dimgMap = (() => {
+    const map = {};
+    try {
+      for (const s of document.scripts) {
+        const t = s.textContent || '';
+        for (const m of t.matchAll(/"(dimg_[^"]+)":"([^"]+)"/g)) {
+          if (/encrypted-tbn|gstatic|ggpht|ytimg/i.test(m[2])) {
+            map[m[1]] = m[2]
+              .replace(/\\u003d/g, '=').replace(/\\u0026/g, '&')
+              .replace(/\\u002f/gi, '/').replace(/\\\//g, '/');
+          }
+        }
+      }
+    } catch (_) {}
+    return map;
+  })();
   const biggestImg = (root) => {
     let best = null, bestArea = 0;
     for (const img of root.querySelectorAll('img')) {
@@ -909,8 +1082,23 @@ function extractVideoList() {
     const title = h3 ? h3.innerText.trim() : t.split('\n')[0];
     if (!title || title.length < 4) continue;
     seen.add(href);
-    const img = biggestImg(a);
-    const dur = (t.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/) || [])[0];
+    // Tiles can split into two same-href anchors (bare title + poster); pick
+    // imgs from the climbed card, not just the anchor.
+    let img = biggestImg(card) || biggestImg(a);
+    // A data-URI pick is Google's pre-swap lazy placeholder — resolve it via
+    // the script map, else prefer any http(s) img on the card.
+    if (img && /^\s*data:image\//.test(img.src || '')) {
+      const mapped = img.id && _dimgMap[img.id];
+      if (mapped) {
+        img = { src: mapped };
+      } else {
+        const scope = card || a;
+        const alt = [...scope.querySelectorAll('img')].find(i => /^https?:/.test(i.src || i.dataset?.src || ''))
+          || [...scope.querySelectorAll('img')].find(i => i.id && _dimgMap[i.id]);
+        if (alt) img = alt.src && /^\s*data:image\//.test(alt.src) ? { src: _dimgMap[alt.id] } : alt;
+      }
+    }
+    const dur = (`${t} ${a.getAttribute('aria-label') || ''}`.match(/\b\d{1,2}:\d{2}(?::\d{2})?\b/) || [])[0];
     out.push({
       title: title.slice(0, 140),
       url: href,
@@ -1046,12 +1234,22 @@ export async function searchGoogleSerp(query, options = {}) {
       // Stepped descent — each lazy region must hold the viewport briefly or
       // the strip's tiles never mount (a single jump races past them).
       for (const y of [h * 0.33, h * 0.66, h]) { window.scrollTo(0, y); await sleep(350); }
+      // Lazy imgs only swap their data-URI placeholder for the real poster
+      // while the strip holds the viewport — park the media section there
+      // briefly, then return to the top.
+      const stripHead = [...document.querySelectorAll('h1,h2,h3,div[role="heading"],strong')]
+        .find(h => /^(short videos|videos|images)$/i.test((h.innerText || '').trim()));
+      if (stripHead) {
+        stripHead.scrollIntoView({ block: 'center' });
+        await sleep(700);
+      }
       window.scrollTo(0, 0);
     });
     await page.waitForTimeout(300);
   } catch (_) {}
 
   let extracted = await page.evaluate(extractSerp, { intent: options.intent });
+  if (extracted.debug?.winner) console.log('[DIAG winner]', JSON.stringify(extracted.debug.winner));
 
   // Overview-first extraction — the combined wait resolves on the AI
   // Overview heading, which often renders BEFORE organic `a h3` anchors

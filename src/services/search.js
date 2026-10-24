@@ -154,6 +154,11 @@ async function searchWithFallback(query, options = {}) {
        ['bing-copilot', 'Bing Copilot', searchBingCopilot],
        ['bing-serp', 'Bing SERP', searchBingSerp]];
   CHAIN.push(['duckduckgo', 'DuckDuckGo', searchDuckDuckGo]);
+  // Configured Brave key → last real-provider fallback before LLM fallback.
+  // Previously explicit-only (provider=brave-web); the smart router never used it.
+  if (process.env.BRAVE_API_WEB_KEY) {
+    CHAIN.push(['brave-web', 'Brave Web', searchBraveWeb]);
+  }
   const primaryKey = CHAIN[0][0];
 
   let step = 1;

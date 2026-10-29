@@ -2,11 +2,13 @@
  * searchBrowserDriver.js — Hidden Chrome search-worker.
  *
  * Owns the Playwright lifecycle for free SERP-based web search:
- *   - Launches REAL Google Chrome (`channel: 'chrome'`) in headed mode,
- *     sized 1×1 and minimized — identical to the hidden-headed pattern in
- *     voice-service/src/companion-driver.cjs and command-service's
- *     browser-engine.cjs. Headed+minimized is used instead of --headless
- *     because headless Chrome is trivially fingerprinted by search engines.
+ *   - Launches bundled Chrome for Testing (CfT) FIRST — a separate app
+ *     bundle that can never hijack or be absorbed by the user's real
+ *     Chrome, hidden offscreen + no Dock icon. Real Chrome (`channel:
+ *     'chrome'`) stays only as a launch-failure fallback or via
+ *     SEARCH_BROWSER_CHANNEL=chrome. Headed+hidden is used instead of
+ *     --headless because headless Chrome is trivially fingerprinted by
+ *     search engines.
  *   - ONE tab is kept alive and reused per query; navigations are
  *     serialized through a promise queue.
  *   - Human-pacing guard: enforces a minimum inter-navigation interval
@@ -85,6 +87,7 @@ class SearchBrowserDriver extends EventEmitter {
     this.engine = null;        // 'chrome' | 'cft'
     this._launchedAt = 0;
     this._forceCft = false;    // set when real Chrome gets absorbed by a running instance
+    this._engineOverride = null; // 'chrome' | 'cft' — set by the launch-failure fallback swap
     this._hideDylib = undefined; // undefined=not attempted, null=build failed, string=ready
     this._engineBlockedUntil = new Map(); // engine -> timestamp: skip navs to a blocking engine instead of paying a timeout per query
     // Survive nodemon/service restarts — otherwise every restart pays one
@@ -202,18 +205,29 @@ class SearchBrowserDriver extends EventEmitter {
 
   async _doStart() {
     this._setStatus('starting');
-    if (!this._forceCft && await this._userChromeRunning()) {
+    // Engine order — bundled CfT FIRST: a separate app bundle can never
+    // hijack or be absorbed by the user's real Chrome, and anonymous SERP
+    // search needs no OAuth warm profile (that is the only reason command-
+    // service's browser-engine.cjs still prefers channel:'chrome').
+    // SEARCH_BROWSER_CHANNEL=chrome restores the old chrome→cft order.
+    const _envChannel = String(process.env.SEARCH_BROWSER_CHANNEL || '').toLowerCase();
+    let useCft = this._engineOverride != null
+      ? this._engineOverride === 'cft'
+      : (_envChannel !== 'chrome' || this._forceCft);
+    if (!useCft && await this._userChromeRunning()) {
       console.warn('[SearchBrowser] user Chrome already running — launching bundled CfT (real Chrome would be absorbed)');
       this._forceCft = true;
+      this._engineOverride = 'cft';
+      useCft = true;
     }
-    const useCft = this._forceCft;
     const engine = useCft ? 'cft' : 'chrome';
     try {
-      // channel:'chrome' = real Google Chrome (warm profile, least bot-like).
-      // Fallback: bundled Chrome for Testing — macOS absorbs a second real-
-      // Chrome launch into the user's running instance (see browser-engine.cjs
-      // in command-service). If our context dies within 5s of launch, assume
-      // absorption and retry once with CfT.
+      // useCft → bundled Chrome for Testing (default). channel:'chrome' =
+      // real Google Chrome — only reached as a launch-failure fallback or
+      // via SEARCH_BROWSER_CHANNEL=chrome; macOS absorbs a second real-Chrome
+      // launch into the user's running instance (see browser-engine.cjs in
+      // command-service). If a real-Chrome context dies within seconds of
+      // launch, assume absorption and retry once with CfT.
       const hideDylib = useCft ? await this._ensureHideDockDylib() : null;
       this.context = await chromium.launchPersistentContext(PROFILE_DIR + (useCft ? '-cft' : ''), {
         ...(useCft ? {} : { channel: 'chrome' }),
@@ -239,6 +253,7 @@ class SearchBrowserDriver extends EventEmitter {
           if (this.engine === 'chrome' && !this._forceCft) {
             console.warn('[SearchBrowser] real Chrome disconnected — retrying with bundled CfT');
             this._forceCft = true;
+            this._engineOverride = 'cft';
             this._relaunchBlockedUntil = 0;
             this.start().catch(() => {});
           }
@@ -277,11 +292,16 @@ class SearchBrowserDriver extends EventEmitter {
     } catch (err) {
       console.error('[SearchBrowser] launch failed:', err.message);
       this._cleanup('degraded');
-      // Chrome not installed, OR launch threw "Opening in existing browser
-      // session" / profile-lock (macOS absorption surfacing at launch time —
-      // same pattern browser-engine.cjs:325 catches) → retry once on CfT.
-      if (!useCft) {
-        this._forceCft = true;
+      // Retry once on the OTHER engine. CfT missing/corrupt → real Chrome,
+      // but only when the user's Chrome isn't already running (a launch then
+      // is absorbed into their instance — pointless). Real-Chrome failure
+      // (absorption/profile-lock surfacing at launch time — same pattern
+      // browser-engine.cjs:325 catches) → CfT.
+      const other = useCft ? 'chrome' : 'cft';
+      if (other === 'cft' || !(await this._userChromeRunning())) {
+        console.warn(`[SearchBrowser] ${useCft ? 'cft' : 'chrome'} launch failed — retrying once on ${other}`);
+        this._engineOverride = other;
+        if (other === 'cft') this._forceCft = true;
         this.starting = false;
         return this.start();
       }
